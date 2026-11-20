@@ -1,0 +1,269 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::error::{ApiError, ErrorKind};
+use crate::lifecycle::MembershipRecord;
+use crate::util::lock;
+
+pub(crate) enum Selector {
+    None,
+    ByHash(String),
+    HighestRateLimit,
+    RoundRobin,
+}
+
+pub(crate) fn parse_selector(selector_json: &str) -> Result<Selector, ApiError> {
+    let trimmed = selector_json.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Ok(Selector::None);
+    }
+    let mut v: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| ApiError::new(ErrorKind::InvalidArgument, format!("selector_json: {e}")))?;
+    if let Some(serde_json::Value::String(hash)) = v.get_mut("by_hash").map(serde_json::Value::take)
+    {
+        return Ok(Selector::ByHash(hash));
+    }
+    match v.get("strategy").and_then(|x| x.as_str()) {
+        Some("round_robin") => Ok(Selector::RoundRobin),
+        Some("highest_rate_limit") => Ok(Selector::HighestRateLimit),
+        Some(other) => Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            format!("unknown strategy {other:?} (round_robin | highest_rate_limit)"),
+        )),
+        None => Err(ApiError::new(
+            ErrorKind::InvalidArgument,
+            "selector_json must carry by_hash or strategy",
+        )),
+    }
+}
+
+static ROUND_ROBIN: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
+
+pub(crate) fn select<'a, R: Borrow<MembershipRecord>>(
+    records: &'a [R],
+    scope: (&str, &str),
+    selector: &Selector,
+) -> Result<&'a MembershipRecord, ApiError> {
+    let rate = |r: &MembershipRecord| r.cache.rate_limit.unwrap_or(0);
+    let mut candidates: Vec<&'a MembershipRecord> = records
+        .iter()
+        .map(Borrow::borrow)
+        .filter(|r| !r.quarantined && r.cache.state.is_usable())
+        .collect();
+    candidates.sort_by(|a, b| a.hash.cmp(&b.hash));
+    if candidates.is_empty() {
+        return Err(ApiError::new(
+            ErrorKind::NoUsableMembership,
+            "no active or grace_period membership for this registry",
+        ));
+    }
+
+    match selector {
+        Selector::ByHash(wanted) => candidates
+            .iter()
+            .find(|r| r.hash == *wanted)
+            .copied()
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorKind::UnknownMembership,
+                    "by_hash matches no usable membership",
+                )
+            }),
+        Selector::None => {
+            if candidates.len() == 1 {
+                Ok(candidates[0])
+            } else {
+                Err(ApiError::new(
+                    ErrorKind::AmbiguousSelection,
+                    "multiple usable memberships; provide a selector",
+                ))
+            }
+        }
+        Selector::HighestRateLimit => Ok(candidates
+            .iter()
+            .max_by(|a, b| rate(a).cmp(&rate(b)).then(b.hash.cmp(&a.hash)))
+            .copied()
+            .expect("invariant: an empty candidate list returned above")),
+        Selector::RoundRobin => {
+            let key = (scope.0.to_string(), scope.1.to_string());
+            let mut guard = lock(&ROUND_ROBIN);
+            let map = guard.get_or_insert_with(HashMap::new);
+            let next = match map.get(&key) {
+                Some(last) => candidates
+                    .iter()
+                    .find(|r| r.hash.as_str() > last.as_str())
+                    .copied()
+                    .unwrap_or(candidates[0]),
+                None => candidates[0],
+            };
+            map.insert(key, next.hash.clone());
+            Ok(next)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::{CacheState, MembershipState};
+
+    fn record(
+        hash: &str,
+        state: MembershipState,
+        rate: u64,
+        quarantined: bool,
+    ) -> MembershipRecord {
+        MembershipRecord {
+            hash: hash.to_string(),
+            identity: crate::sealed_store::format::IdentityBlock {
+                registry_id: "logos:local:aa".to_string(),
+                rln_identifier: String::new(),
+                identity_commitment: "11".repeat(32),
+                submitted_at: 0,
+            },
+            cache: CacheState {
+                state,
+                rate_limit: Some(rate),
+                ..CacheState::default()
+            },
+            alloc: crate::rate_limit::AllocationState::default(),
+            quarantined,
+        }
+    }
+
+    const SCOPE: (&str, &str) = ("logos:local:aa", "deadbeef");
+
+    #[test]
+    fn only_usable_states_are_candidates() {
+        let records = vec![
+            record("a1", MembershipState::Pending, 300, false),
+            record("b2", MembershipState::Failed, 300, false),
+            record("c3", MembershipState::Expired, 300, false),
+            record("d4", MembershipState::Active, 300, true),
+        ];
+        let err = select(&records, SCOPE, &Selector::None)
+            .map(|r| &r.hash)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NoUsableMembership);
+    }
+
+    #[test]
+    fn sole_candidate_is_returned_multiple_require_selector() {
+        let one = vec![record("a1", MembershipState::Active, 300, false)];
+        assert_eq!(select(&one, SCOPE, &Selector::None).unwrap().hash, "a1");
+
+        let two = vec![
+            record("a1", MembershipState::Active, 300, false),
+            record("b2", MembershipState::GracePeriod, 300, false),
+        ];
+        let err = select(&two, SCOPE, &Selector::None)
+            .map(|r| &r.hash)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::AmbiguousSelection);
+    }
+
+    #[test]
+    fn by_hash_hits_usable_and_misses_everything_else() {
+        let records = vec![
+            record("a1", MembershipState::Active, 300, false),
+            record("b2", MembershipState::Failed, 300, false),
+        ];
+        assert_eq!(
+            select(&records, SCOPE, &Selector::ByHash("a1".into()))
+                .unwrap()
+                .hash,
+            "a1"
+        );
+        let err = select(&records, SCOPE, &Selector::ByHash("b2".into()))
+            .map(|r| &r.hash)
+            .unwrap_err();
+        assert_eq!(
+            err.kind,
+            ErrorKind::UnknownMembership,
+            "failed record is not usable"
+        );
+    }
+
+    #[test]
+    fn highest_rate_limit_with_lowest_hash_tie_break() {
+        let records = vec![
+            record("c3", MembershipState::Active, 500, false),
+            record("a1", MembershipState::Active, 500, false),
+            record("b2", MembershipState::Active, 200, false),
+        ];
+        assert_eq!(
+            select(&records, SCOPE, &Selector::HighestRateLimit)
+                .unwrap()
+                .hash,
+            "a1"
+        );
+    }
+
+    #[test]
+    fn round_robin_rotates_per_scope_and_survives_churn() {
+        let records = vec![
+            record("a1", MembershipState::Active, 300, false),
+            record("b2", MembershipState::Active, 300, false),
+            record("c3", MembershipState::Active, 300, false),
+        ];
+        let scope_x = ("logos:local:aa", "aaaa1111");
+        let scope_y = ("logos:local:aa", "bbbb2222");
+
+        assert_eq!(
+            select(&records, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
+            "a1"
+        );
+        assert_eq!(
+            select(&records, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
+            "b2"
+        );
+        assert_eq!(
+            select(&records, scope_y, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
+            "a1"
+        );
+        let churned = vec![
+            record("a1", MembershipState::Active, 300, false),
+            record("c3", MembershipState::Active, 300, false),
+        ];
+        assert_eq!(
+            select(&churned, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
+            "c3"
+        );
+        assert_eq!(
+            select(&churned, scope_x, &Selector::RoundRobin)
+                .unwrap()
+                .hash,
+            "a1"
+        );
+    }
+
+    #[test]
+    fn selector_parsing() {
+        assert!(matches!(parse_selector(""), Ok(Selector::None)));
+        assert!(matches!(parse_selector(" {} "), Ok(Selector::None)));
+        assert!(matches!(
+            parse_selector(r#"{"by_hash":"abc"}"#),
+            Ok(Selector::ByHash(h)) if h == "abc"
+        ));
+        assert!(matches!(
+            parse_selector(r#"{"strategy":"round_robin"}"#),
+            Ok(Selector::RoundRobin)
+        ));
+        assert!(matches!(
+            parse_selector(r#"{"strategy":"highest_rate_limit"}"#),
+            Ok(Selector::HighestRateLimit)
+        ));
+        assert!(parse_selector(r#"{"strategy":"lowest"}"#).is_err());
+        assert!(parse_selector(r#"{"foo":1}"#).is_err());
+        assert!(parse_selector("not json").is_err());
+    }
+}

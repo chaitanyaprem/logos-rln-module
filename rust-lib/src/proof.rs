@@ -1,0 +1,812 @@
+use std::sync::LazyLock;
+
+use rand_chacha::ChaCha20Rng;
+use rln::prelude::{
+    compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend,
+    CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof,
+    RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless,
+    VerifyProofError, RLN,
+};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+use crate::registry_id::{bytes_to_hex, hex_decode_into, hex_to_bytes32, hex_to_vec};
+
+pub(crate) const RLN_TREE_DEPTH: usize = 10;
+
+const DEPTH_10_GRAPH: &[u8] = include_bytes!("../resources/tree_depth_10/graph.bin");
+const DEPTH_10_ZKEY: &[u8] = include_bytes!("../resources/tree_depth_10/rln_final.arkzkey");
+
+#[derive(Debug)]
+pub(crate) enum ProofError {
+    BadInput(String),
+    Engine(String),
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub(crate) struct WitnessMaterial {
+    pub(crate) identity_secret_hash_hex: String,
+    pub(crate) rate_limit: u64,
+    pub(crate) message_id: u64,
+    pub(crate) path_elements_hex: Vec<String>,
+    pub(crate) path_indices: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RateLimitProof {
+    canonical: Vec<u8>,
+    root: [u8; 32],
+    external_nullifier: [u8; 32],
+    share_x: [u8; 32],
+    share_y: [u8; 32],
+    nullifier: [u8; 32],
+    epoch: Option<u64>,
+}
+
+const GROTH16_LEN: usize = 128;
+
+impl RateLimitProof {
+    fn from_parts(proof: Proof, values: RLNProofValues) -> Result<Self, ProofError> {
+        let (share_y, nullifier) = single_values(&values)?;
+        let root = fr_to_bytes32(&values.root());
+        let external_nullifier = fr_to_bytes32(&values.external_nullifier());
+        let share_x = fr_to_bytes32(&values.x());
+        let rln_proof = RLNProof::new(proof, values);
+        let mut canonical = Vec::new();
+        rln_proof
+            .serialize_compressed(&mut canonical)
+            .map_err(|e| ProofError::Engine(format!("serialize proof: {e}")))?;
+        Ok(RateLimitProof {
+            canonical,
+            root,
+            external_nullifier,
+            share_x,
+            share_y: fr_to_bytes32(&share_y),
+            nullifier: fr_to_bytes32(&nullifier),
+            epoch: None,
+        })
+    }
+
+    pub(crate) fn root(&self) -> [u8; 32] {
+        self.root
+    }
+
+    pub(crate) fn canonical_hex(&self) -> String {
+        bytes_to_hex(&self.canonical)
+    }
+
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::json!({
+            "proof": bytes_to_hex(&self.canonical[..GROTH16_LEN.min(self.canonical.len())]),
+            "root": bytes_to_hex(&self.root),
+            "external_nullifier": bytes_to_hex(&self.external_nullifier),
+            "share_x": bytes_to_hex(&self.share_x),
+            "share_y": bytes_to_hex(&self.share_y),
+            "nullifier": bytes_to_hex(&self.nullifier),
+        });
+        if let Some(epoch) = self.epoch {
+            out["epoch"] = serde_json::Value::String(bytes_to_hex(&epoch_to_bytes(epoch)));
+        }
+        out
+    }
+
+    pub(crate) fn from_json(value: &serde_json::Value) -> Result<Self, ProofError> {
+        let proof_hex = value
+            .get("proof")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ProofError::BadInput("proof: missing proof bytes".into()))?;
+        let bytes = hex_to_vec(proof_hex)
+            .ok_or_else(|| ProofError::BadInput("proof: not valid hex".into()))?;
+
+        let canonical: Vec<u8> = if bytes.len() == GROTH16_LEN {
+            let field = |key: &str| -> Result<Fr, ProofError> {
+                let hex = value.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+                    ProofError::BadInput(format!(
+                        "{key}: expected 32-byte hex alongside a bare proof"
+                    ))
+                })?;
+                hex_to_fr(hex, key)
+            };
+            let zk_proof = Proof::deserialize_compressed(&bytes[..]).map_err(|e| {
+                ProofError::BadInput(format!("proof: not a valid Groth16 proof: {e}"))
+            })?;
+            let values = RLNProofValues::new_single()
+                .y(field("share_y")?)
+                .root(field("root")?)
+                .nullifier(field("nullifier")?)
+                .x(field("share_x")?)
+                .external_nullifier(field("external_nullifier")?)
+                .build();
+            let rln_proof = RLNProof::new(zk_proof, values);
+            let mut out = Vec::new();
+            rln_proof
+                .serialize_compressed(&mut out)
+                .map_err(|e| ProofError::Engine(format!("serialize proof: {e}")))?;
+            out
+        } else {
+            bytes
+        };
+
+        let epoch = match value.get("epoch") {
+            None => None,
+            Some(v) => {
+                if let Some(index) = v.as_u64() {
+                    Some(index)
+                } else {
+                    let hex = v.as_str().ok_or_else(|| {
+                        ProofError::BadInput("epoch: expected 32-byte hex or u64 index".into())
+                    })?;
+                    let bytes = hex_to_bytes32(hex).ok_or_else(|| {
+                        ProofError::BadInput("epoch: expected 32-byte hex or u64 index".into())
+                    })?;
+                    Some(epoch_from_bytes(&bytes).ok_or_else(|| {
+                        ProofError::BadInput("epoch: non-canonical padding".into())
+                    })?)
+                }
+            }
+        };
+
+        let rln_proof = parse_canonical(&canonical)?;
+        let mut proof = Self::from_parts(rln_proof.proof, rln_proof.values)?;
+        proof.epoch = epoch;
+        Ok(proof)
+    }
+
+    pub(crate) fn external_nullifier(&self) -> [u8; 32] {
+        self.external_nullifier
+    }
+
+    pub(crate) fn nullifier(&self) -> [u8; 32] {
+        self.nullifier
+    }
+
+    pub(crate) fn share_x(&self) -> [u8; 32] {
+        self.share_x
+    }
+
+    pub(crate) fn share_y(&self) -> [u8; 32] {
+        self.share_y
+    }
+
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    fn to_rln_proof(&self) -> Result<RLNProof, ProofError> {
+        parse_canonical(&self.canonical)
+    }
+}
+
+static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> =
+    LazyLock::new(|| {
+        RLNBuilder::stateless()
+            .graph(
+                graph_from_raw(DEPTH_10_GRAPH, Some(RLN_TREE_DEPTH), None)
+                    .expect("invariant: the vendored depth-10 graph loads at the circuit depth"),
+            )
+            .zkey(
+                zkey_from_raw(DEPTH_10_ZKEY).expect("invariant: the vendored depth-10 zkey loads"),
+            )
+            .build()
+    });
+
+fn single_values(values: &RLNProofValues) -> Result<(Fr, Fr), ProofError> {
+    match (values.y(), values.nullifier()) {
+        (Some(y), Some(nullifier)) => Ok((y, nullifier)),
+        _ => Err(ProofError::Engine(
+            "multi-mode proof values unsupported".into(),
+        )),
+    }
+}
+
+fn parse_canonical(bytes: &[u8]) -> Result<RLNProof, ProofError> {
+    let rln_proof = RLNProof::deserialize_compressed(bytes)
+        .map_err(|e| ProofError::BadInput(format!("proof: not a valid RLN proof: {e}")))?;
+    if rln_proof.values.y().is_none() {
+        return Err(ProofError::BadInput(
+            "proof: multi-mode proofs are not supported".into(),
+        ));
+    }
+    Ok(rln_proof)
+}
+
+fn epoch_to_bytes(epoch: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[..8].copy_from_slice(&epoch.to_le_bytes());
+    out
+}
+
+pub(crate) fn epoch_from_bytes(bytes: &[u8; 32]) -> Option<u64> {
+    if bytes[8..32].iter().any(|&b| b != 0) {
+        return None;
+    }
+    Some(u64::from_le_bytes(
+        bytes[..8]
+            .try_into()
+            .expect("invariant: an 8-byte range converts to [u8; 8]"),
+    ))
+}
+
+fn external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> Fr {
+    let epoch_fr = hash_to_field_le(&epoch_to_bytes(epoch));
+    let rln_identifier_fr = hash_to_field_le(rln_identifier);
+    Hasher::<PoseidonHash>::hash_pair(epoch_fr, rln_identifier_fr)
+}
+
+pub(crate) use rln_signal::signal_to_x;
+
+pub(crate) fn x_from_hash_hex(hex: &str) -> Result<Fr, ProofError> {
+    hex_to_fr(hex, "signal_hash")
+}
+
+pub(crate) fn expected_external_nullifier(epoch: u64, rln_identifier: &[u8; 32]) -> [u8; 32] {
+    fr_to_bytes32(&external_nullifier(epoch, rln_identifier))
+}
+
+fn fr_to_bytes32(fr: &Fr) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    fr.serialize_compressed(&mut out[..])
+        .expect("invariant: Fr's canonical LE form is exactly 32 bytes");
+    out
+}
+
+fn secret_to_bytes32(secret: &SecretFr) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    write_secret_bytes32(secret, &mut out);
+    out
+}
+
+fn write_secret_bytes32(secret: &SecretFr, out: &mut [u8; 32]) {
+    secret
+        .serialize_compressed(&mut out[..])
+        .expect("invariant: SecretFr's canonical LE form is exactly 32 bytes");
+}
+
+pub(crate) mod depth_bridge {
+    use super::{
+        CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, PoseidonHash, RLN_TREE_DEPTH,
+    };
+    use crate::registry_id::{bytes_to_hex, hex_to_bytes32};
+    use std::sync::LazyLock;
+
+    static ZERO_LADDER: LazyLock<Vec<Fr>> = LazyLock::new(|| {
+        let mut ladder = vec![Fr::from(0u64)];
+        for height in 1..=RLN_TREE_DEPTH {
+            let below = ladder[height - 1];
+            ladder.push(Hasher::<PoseidonHash>::hash_pair(below, below));
+        }
+        ladder
+    });
+
+    fn fr_to_hex(value: &Fr) -> String {
+        let mut bytes = [0u8; 32];
+        value
+            .serialize_compressed(&mut bytes[..])
+            .expect("invariant: a field element serializes into 32 bytes");
+        bytes_to_hex(&bytes)
+    }
+
+    fn fr_from_hex(hex: &str) -> Option<Fr> {
+        let bytes = hex_to_bytes32(hex)?;
+        Fr::deserialize_compressed(&bytes[..]).ok()
+    }
+
+    pub(crate) fn pad_path(elements: &mut Vec<String>, indices: &mut Vec<u8>, depth: usize) {
+        for height in depth..RLN_TREE_DEPTH {
+            elements.push(fr_to_hex(&ZERO_LADDER[height]));
+            indices.push(0);
+        }
+    }
+
+    pub(crate) fn fold_root(root_hex: &str, depth: usize) -> String {
+        let Some(mut root) = fr_from_hex(root_hex) else {
+            return root_hex.to_string();
+        };
+        for height in depth..RLN_TREE_DEPTH {
+            root = Hasher::<PoseidonHash>::hash_pair(root, ZERO_LADDER[height]);
+        }
+        fr_to_hex(&root)
+    }
+}
+
+fn hex_to_fr(hex: &str, label: &str) -> Result<Fr, ProofError> {
+    let bytes = hex_to_bytes32(hex)
+        .ok_or_else(|| ProofError::BadInput(format!("{label}: expected 32-byte hex")))?;
+    Fr::deserialize_compressed(&bytes[..])
+        .map_err(|e| ProofError::BadInput(format!("{label}: not a field element: {e}")))
+}
+
+pub(crate) fn generate_identity() -> Result<(String, String), ProofError> {
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).map_err(|e| ProofError::Engine(format!("rng: {e}")))?;
+    let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&seed);
+    seed.zeroize();
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    write_secret_bytes32(&keys.identity_secret(), &mut secret_bytes);
+    Ok((
+        bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
+        bytes_to_hex(&secret_bytes[..]),
+    ))
+}
+
+pub(crate) fn generate(
+    material: &WitnessMaterial,
+    x: Fr,
+    epoch: u64,
+    rln_identifier: &[u8; 32],
+) -> Result<RateLimitProof, ProofError> {
+    if material.path_elements_hex.len() != material.path_indices.len() {
+        return Err(ProofError::BadInput(format!(
+            "merkle path length mismatch: {} elements vs {} indices",
+            material.path_elements_hex.len(),
+            material.path_indices.len()
+        )));
+    }
+    if material.path_elements_hex.len() != RLN_TREE_DEPTH {
+        return Err(ProofError::BadInput(format!(
+            "merkle path depth {} != circuit depth {RLN_TREE_DEPTH}",
+            material.path_elements_hex.len()
+        )));
+    }
+
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    if !hex_decode_into(&material.identity_secret_hash_hex, &mut secret_bytes[..]) {
+        return Err(ProofError::BadInput(
+            "identity_secret_hash: expected 32-byte hex".into(),
+        ));
+    }
+    let identity_secret = SecretFr::deserialize_compressed(&secret_bytes[..])
+        .map_err(|e| ProofError::BadInput(format!("identity_secret: {e}")))?;
+
+    let path_elements = material
+        .path_elements_hex
+        .iter()
+        .map(|h| hex_to_fr(h, "path_element"))
+        .collect::<Result<Vec<Fr>, _>>()?;
+
+    let witness = RLNWitnessInput::new_single()
+        .identity_secret(identity_secret)
+        .user_message_limit(Fr::from(material.rate_limit))
+        .message_id(Fr::from(material.message_id))
+        .merkle_proof(RLNMerkleProof::new(
+            path_elements,
+            material.path_indices.clone(),
+        ))
+        .x(x)
+        .external_nullifier(external_nullifier(epoch, rln_identifier))
+        .build()
+        .map_err(|e| ProofError::BadInput(format!("witness: {e}")))?;
+
+    let (proof, values) = RLN_STATELESS
+        .generate_proof(&witness)
+        .map_err(|e| ProofError::Engine(format!("generate: {e}")))?;
+    let mut rlp = RateLimitProof::from_parts(proof, values)?;
+    rlp.epoch = Some(epoch);
+    Ok(rlp)
+}
+
+pub(crate) fn verify(
+    proof: &RateLimitProof,
+    x: Fr,
+    valid_roots: &[[u8; 32]],
+) -> Result<bool, ProofError> {
+    let rln_proof = proof.to_rln_proof()?;
+    let roots: Vec<Fr> = valid_roots
+        .iter()
+        .filter_map(|r| Fr::deserialize_compressed(&r[..]).ok())
+        .collect();
+    if !valid_roots.is_empty() && roots.is_empty() {
+        return Ok(false);
+    }
+
+    match RLN_STATELESS.verify_with_roots(&rln_proof.proof, &rln_proof.values, &x, &roots) {
+        Ok(verdict) => Ok(verdict),
+        Err(VerifyProofError::InvalidRoot | VerifyProofError::InvalidSignal) => Ok(false),
+        Err(e) => Err(ProofError::Engine(format!("verify: {e}"))),
+    }
+}
+
+pub(crate) fn recover_identity_secret_hex(
+    prior: ([u8; 32], [u8; 32]),
+    current: ([u8; 32], [u8; 32]),
+) -> Result<String, ProofError> {
+    let field = |bytes: &[u8; 32], label: &str| -> Result<Fr, ProofError> {
+        Fr::deserialize_compressed(&bytes[..])
+            .map_err(|e| ProofError::BadInput(format!("{label}: not a field element: {e}")))
+    };
+    let share1 = (
+        field(&prior.0, "prior share_x")?,
+        field(&prior.1, "prior share_y")?,
+    );
+    let share2 = (field(&current.0, "share_x")?, field(&current.1, "share_y")?);
+    let secret = compute_id_secret(share1, share2)
+        .map_err(|e| ProofError::Engine(format!("recover id secret: {e}")))?;
+    Ok(bytes_to_hex(&secret_to_bytes32(&secret)))
+}
+
+#[cfg(test)]
+pub(crate) fn generate_for_test(
+    seed: &[u8],
+    signal: &[u8],
+    epoch: u64,
+    rln_identifier: &[u8; 32],
+) -> RateLimitProof {
+    let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
+    let material = WitnessMaterial {
+        identity_secret_hash_hex: bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
+        rate_limit: 100,
+        message_id: 0,
+        path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
+        path_indices: vec![0u8; RLN_TREE_DEPTH],
+    };
+    generate(&material, signal_to_x(signal), epoch, rln_identifier).expect("test proof")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_path() -> (Vec<String>, Vec<u8>) {
+        let elements = vec!["00".repeat(32); RLN_TREE_DEPTH];
+        let indices = vec![0u8; RLN_TREE_DEPTH];
+        (elements, indices)
+    }
+
+    fn material_from_seed(seed: &[u8], rate_limit: u64, message_id: u64) -> WitnessMaterial {
+        let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
+        let secret_hex = bytes_to_hex(&secret_to_bytes32(&keys.identity_secret()));
+        let (elements, indices) = zero_path();
+        WitnessMaterial {
+            identity_secret_hash_hex: secret_hex,
+            rate_limit,
+            message_id,
+            path_elements_hex: elements,
+            path_indices: indices,
+        }
+    }
+
+    #[test]
+    fn padding_and_folding_agree() {
+        use crate::registry_id::bytes_to_hex;
+
+        const REGISTRY_DEPTH: usize = 9;
+
+        let leaf = Hasher::<PoseidonHash>::hash_pair(Fr::from(11u64), Fr::from(22u64));
+        let mut elements: Vec<String> = (0..REGISTRY_DEPTH)
+            .map(|i| {
+                let mut buf = [0u8; 32];
+                Fr::from(i as u64 + 7)
+                    .serialize_compressed(&mut buf[..])
+                    .expect("32 bytes");
+                bytes_to_hex(&buf)
+            })
+            .collect();
+        let mut indices = vec![0u8; REGISTRY_DEPTH];
+
+        let fold_through = |leaf: Fr, elements: &[String], indices: &[u8]| -> Fr {
+            let mut node = leaf;
+            for (hex, &is_right) in elements.iter().zip(indices) {
+                let sibling = hex_to_fr(hex, "sibling").expect("test sibling");
+                node = if is_right == 0 {
+                    Hasher::<PoseidonHash>::hash_pair(node, sibling)
+                } else {
+                    Hasher::<PoseidonHash>::hash_pair(sibling, node)
+                };
+            }
+            node
+        };
+
+        let registry_root = fold_through(leaf, &elements, &indices);
+        let mut root_bytes = [0u8; 32];
+        registry_root
+            .serialize_compressed(&mut root_bytes[..])
+            .expect("32 bytes");
+
+        let lifted = depth_bridge::fold_root(&bytes_to_hex(&root_bytes), REGISTRY_DEPTH);
+        depth_bridge::pad_path(&mut elements, &mut indices, REGISTRY_DEPTH);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+        assert_eq!(indices.len(), RLN_TREE_DEPTH);
+
+        let through_padded = fold_through(leaf, &elements, &indices);
+        let mut padded_bytes = [0u8; 32];
+        through_padded
+            .serialize_compressed(&mut padded_bytes[..])
+            .expect("32 bytes");
+
+        assert_eq!(
+            lifted,
+            bytes_to_hex(&padded_bytes),
+            "a lifted root must equal the root the padded path folds to"
+        );
+    }
+
+    #[test]
+    fn padding_a_full_depth_path_changes_nothing() {
+        let (mut elements, mut indices) = zero_path();
+        let before = elements.clone();
+        depth_bridge::pad_path(&mut elements, &mut indices, RLN_TREE_DEPTH);
+        assert_eq!(elements, before);
+        assert_eq!(elements.len(), RLN_TREE_DEPTH);
+
+        let root = "00".repeat(32);
+        assert_eq!(depth_bridge::fold_root(&root, RLN_TREE_DEPTH), root);
+    }
+
+    #[test]
+    fn prehashed_signal_round_trips_and_rejects_non_canonical() {
+        let x = signal_to_x(b"Hello, RLN!");
+        let hex = bytes_to_hex(&fr_to_bytes32(&x));
+        assert_eq!(x_from_hash_hex(&hex).expect("canonical"), x);
+        assert_eq!(
+            x_from_hash_hex(&format!("0x{hex}")).expect("0x tolerated"),
+            x
+        );
+        assert_eq!(fr_to_bytes32(&x), rln_signal::signal_hash(b"Hello, RLN!"));
+
+        assert!(matches!(
+            x_from_hash_hex(&"ff".repeat(32)),
+            Err(ProofError::BadInput(m)) if m.contains("signal_hash")
+        ));
+        assert!(matches!(
+            x_from_hash_hex(&"ab".repeat(31)),
+            Err(ProofError::BadInput(_))
+        ));
+        assert!(matches!(
+            x_from_hash_hex("zz"),
+            Err(ProofError::BadInput(_))
+        ));
+    }
+
+    #[test]
+    fn frozen_interop_vectors() {
+        let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(&[7u8; 32]);
+        assert_eq!(
+            bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
+            "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
+        );
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
+            "08772427f3a88a9787e8f899c13dc10c2b0a226d7500c99edba0f993ba770729"
+        );
+
+        let rln_id = [9u8; 32];
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes32(&external_nullifier(1231028105, &rln_id))),
+            "a432bb300aeda21d8c14186e134639ecac20732e9ebcbb73139741cef293612a"
+        );
+
+        assert_eq!(
+            bytes_to_hex(&fr_to_bytes32(&signal_to_x(b"Hello, RLN!"))),
+            "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
+        );
+
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let j = generate(&material, signal_to_x(b"Hello, RLN!"), 1231028105, &rln_id)
+            .expect("generate")
+            .to_json();
+        assert_eq!(
+            j["root"].as_str().unwrap(),
+            "16f5e233ad4c8ee7d66d1b0909f942e3384eb12721296690d340cc77ff41aa1b"
+        );
+        assert_eq!(
+            j["nullifier"].as_str().unwrap(),
+            "0d78806341fee59517f2526662095294eee5f590be3c36d9e7d29680b73aa21a"
+        );
+        assert_eq!(
+            j["share_x"].as_str().unwrap(),
+            "9af96b554db1bc4bfb806f3bcd587c8c0ee80d4d79c440a87b51861235461412"
+        );
+        assert_eq!(
+            j["epoch"].as_str().unwrap(),
+            "89ff5f4900000000000000000000000000000000000000000000000000000000"
+        );
+
+        let j2 = generate(
+            &material_from_seed(&[7u8; 32], 100, 1),
+            signal_to_x(b"Hello, RLN!"),
+            1231028105,
+            &rln_id,
+        )
+        .expect("generate mid=1")
+        .to_json();
+        assert_eq!(
+            j2["nullifier"].as_str().unwrap(),
+            "cbf8daa2f4d16e31165c6789a738681b0871a5cc775206af276ad4295e185e1e"
+        );
+
+        let bare = hex_to_vec(j["proof"].as_str().unwrap()).unwrap();
+        assert_eq!(bare.len(), 128, "to_json emits the bare spec proof[128]");
+    }
+
+    #[test]
+    fn generate_then_verify_roundtrips() {
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let rln_id = [9u8; 32];
+        let proof =
+            generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
+        let root = proof.root();
+        assert!(verify(&proof, signal_to_x(b"hello"), &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn wrong_signal_is_invalid_not_error() {
+        let material = material_from_seed(&[7u8; 32], 100, 0);
+        let rln_id = [9u8; 32];
+        let proof =
+            generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
+        let root = proof.root();
+        assert!(!verify(&proof, signal_to_x(b"goodbye"), &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn root_outside_window_is_invalid() {
+        let rln_id = [9u8; 32];
+        let a = generate(
+            &material_from_seed(&[7u8; 32], 100, 0),
+            signal_to_x(b"hello"),
+            1,
+            &rln_id,
+        )
+        .expect("generate a");
+        let b = generate(
+            &material_from_seed(&[8u8; 32], 100, 0),
+            signal_to_x(b"hello"),
+            1,
+            &rln_id,
+        )
+        .expect("generate b");
+        assert_ne!(a.root(), b.root());
+        assert!(!verify(&a, signal_to_x(b"hello"), &[b.root()]).expect("verify"));
+        assert!(!verify(&a, signal_to_x(b"hello"), &[[0xffu8; 32]]).expect("verify non-canonical"));
+    }
+
+    #[test]
+    fn decomposed_spec_struct_roundtrip_verifies() {
+        let material = material_from_seed(&[5u8; 32], 100, 2);
+        let rln_id = [6u8; 32];
+        let proof = generate(&material, signal_to_x(b"net msg"), 77, &rln_id).expect("generate");
+        let root = proof.root();
+        let j = proof.to_json();
+
+        let decomposed = serde_json::json!({
+            "proof": j["proof"],
+            "root": j["root"],
+            "external_nullifier": j["external_nullifier"],
+            "share_x": j["share_x"],
+            "share_y": j["share_y"],
+            "nullifier": j["nullifier"],
+        });
+
+        let restored = RateLimitProof::from_json(&decomposed).expect("decomposed from_json");
+        assert_eq!(restored.root(), root);
+        assert_eq!(
+            restored.to_json()["proof"],
+            j["proof"],
+            "reconstruction must be byte-identical to the canonical form"
+        );
+        assert!(verify(&restored, signal_to_x(b"net msg"), &[root]).expect("verify"));
+
+        let mut bad = decomposed;
+        bad["share_y"] = serde_json::json!("11".repeat(32));
+        match RateLimitProof::from_json(&bad) {
+            Err(_) => {}
+            Ok(p) => {
+                assert!(!verify(&p, signal_to_x(b"net msg"), &[root]).expect("verify tampered"))
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_blob_alone_round_trips() {
+        let material = material_from_seed(&[5u8; 32], 100, 2);
+        let rln_id = [6u8; 32];
+        let proof = generate(&material, signal_to_x(b"net msg"), 77, &rln_id).expect("generate");
+        let hex = proof.canonical_hex();
+        assert_eq!(
+            hex.len(),
+            289 * 2,
+            "Single-mode canonical blob is 289 bytes"
+        );
+        assert!(
+            hex.starts_with(proof.to_json()["proof"].as_str().unwrap()),
+            "the blob's leading segment is the bare proof[128]"
+        );
+
+        let restored = RateLimitProof::from_json(&serde_json::json!({ "proof": hex }))
+            .expect("blob-only from_json");
+        assert_eq!(restored.root(), proof.root());
+        assert!(verify(&restored, signal_to_x(b"net msg"), &[proof.root()]).expect("verify"));
+    }
+
+    #[test]
+    fn json_roundtrip_preserves_verification() {
+        let material = material_from_seed(&[3u8; 32], 100, 1);
+        let rln_id = [4u8; 32];
+        let proof = generate(&material, signal_to_x(b"signal"), 42, &rln_id).expect("generate");
+        let root = proof.root();
+        let json = proof.to_json();
+        let restored = RateLimitProof::from_json(&json).expect("from_json");
+        assert_eq!(restored.root(), root);
+        assert_eq!(proof.epoch(), Some(42));
+        assert_eq!(
+            restored.epoch(),
+            Some(42),
+            "the epoch survives the round trip"
+        );
+        assert!(verify(&restored, signal_to_x(b"signal"), &[root]).expect("verify"));
+    }
+
+    #[test]
+    fn message_id_at_or_above_rate_limit_is_bad_input() {
+        let material = material_from_seed(&[1u8; 32], 5, 5);
+        let err = generate(&material, signal_to_x(b"x"), 1, &[0u8; 32]).unwrap_err();
+        assert!(matches!(err, ProofError::BadInput(_)));
+    }
+
+    #[test]
+    fn short_merkle_path_is_bad_input() {
+        let mut material = material_from_seed(&[1u8; 32], 100, 0);
+        material.path_elements_hex.truncate(RLN_TREE_DEPTH - 1);
+        material.path_indices.truncate(RLN_TREE_DEPTH - 1);
+        let err = generate(&material, signal_to_x(b"x"), 1, &[0u8; 32]).unwrap_err();
+        assert!(matches!(err, ProofError::BadInput(_)));
+    }
+
+    #[test]
+    fn epoch_from_bytes_rejects_non_canonical_padding() {
+        let canonical = epoch_to_bytes(1231028105);
+        assert_eq!(epoch_from_bytes(&canonical), Some(1231028105));
+
+        let mut tampered = canonical;
+        tampered[20] = 0xff;
+        assert_eq!(epoch_from_bytes(&tampered), None);
+    }
+
+    #[test]
+    fn from_json_accepts_numeric_epoch_from_the_handler_reply() {
+        let material = material_from_seed(&[3u8; 32], 100, 1);
+        let rln_id = [4u8; 32];
+        let proof = generate(&material, signal_to_x(b"signal"), 42, &rln_id).expect("generate");
+
+        let mut wire = proof.to_json();
+        wire["epoch"] = serde_json::json!(42u64);
+        let restored = RateLimitProof::from_json(&wire).expect("from_json");
+        assert_eq!(restored.epoch(), Some(42));
+
+        wire["epoch"] = serde_json::json!(-1);
+        assert!(matches!(
+            RateLimitProof::from_json(&wire).unwrap_err(),
+            ProofError::BadInput(_)
+        ));
+    }
+
+    #[test]
+    fn recover_identity_secret_from_colliding_shares() {
+        let rln_id = [9u8; 32];
+        let a = generate_for_test(&[7u8; 32], b"signal-A", 1231028105, &rln_id);
+        let b = generate_for_test(&[7u8; 32], b"signal-B", 1231028105, &rln_id);
+        assert_eq!(
+            a.nullifier(),
+            b.nullifier(),
+            "same identity+epoch+slot ⇒ one nullifier"
+        );
+        assert_ne!(
+            a.share_x(),
+            b.share_x(),
+            "distinct signals ⇒ distinct share_x"
+        );
+
+        let secret =
+            recover_identity_secret_hex((a.share_x(), a.share_y()), (b.share_x(), b.share_y()))
+                .expect("recover");
+        assert_eq!(
+            secret,
+            "3c87aa7480ec2cad022ef39c256ddb6e4fb083c7d4a0dfdc4eee891feda7a62b"
+        );
+    }
+
+    #[test]
+    fn witness_material_is_zeroized_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<WitnessMaterial>();
+    }
+}

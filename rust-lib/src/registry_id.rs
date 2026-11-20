@@ -1,0 +1,228 @@
+use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+pub(crate) struct CanonicalRegistryId {
+    pub(crate) namespace: String,
+    pub(crate) reference: String,
+    pub(crate) account: String,
+    pub(crate) canonical: String,
+}
+
+pub(crate) fn parse(raw: &str) -> Result<CanonicalRegistryId, String> {
+    let raw = raw.trim();
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "registry_id must be namespace:reference:account_address (CAIP-10), got {} segment(s)",
+            parts.len()
+        ));
+    }
+    let (namespace, reference, account_raw) = (parts[0], parts[1], parts[2]);
+
+    if namespace.len() < 3
+        || namespace.len() > 8
+        || !namespace
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err("chain namespace must match [-a-z0-9]{3,8}".to_string());
+    }
+    if reference.is_empty()
+        || reference.len() > 32
+        || !reference
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("chain reference must match [-_a-zA-Z0-9]{1,32}".to_string());
+    }
+
+    let reference = if namespace == "logos" {
+        reference.to_ascii_lowercase()
+    } else {
+        reference.to_string()
+    };
+
+    let account = if namespace == "logos" {
+        match hex_to_bytes32(account_raw) {
+            Some(bytes) => bytes_to_hex(&bytes),
+            None => {
+                return Err(
+                    "logos account_address must be the 64-hex config account (0x prefix ok)"
+                        .to_string(),
+                )
+            }
+        }
+    } else {
+        if account_raw.is_empty()
+            || account_raw.len() > 128
+            || !account_raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'%')
+        {
+            return Err("account_address must match [-.%a-zA-Z0-9]{1,128}".to_string());
+        }
+        account_raw.to_string()
+    };
+
+    Ok(CanonicalRegistryId {
+        namespace: namespace.to_string(),
+        canonical: format!("{namespace}:{reference}:{account}"),
+        reference,
+        account,
+    })
+}
+
+pub(crate) fn membership_hash(
+    canonical_registry_id: &str,
+    identity_commitment_le: &[u8; 32],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical_registry_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(identity_commitment_le);
+    bytes_to_hex(&hasher.finalize())
+}
+
+pub(crate) fn bytes_to_hex(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+fn hex_digits(hex: &str) -> &[u8] {
+    let s = hex.trim();
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
+        .as_bytes()
+}
+
+fn hex_pair(pair: &[u8]) -> Option<u8> {
+    let hi = (pair[0] as char).to_digit(16)?;
+    let lo = (pair[1] as char).to_digit(16)?;
+    Some(((hi << 4) | lo) as u8)
+}
+
+pub(crate) fn hex_to_vec(hex: &str) -> Option<Vec<u8>> {
+    let digits = hex_digits(hex);
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks(2) {
+        out.push(hex_pair(pair)?);
+    }
+    Some(out)
+}
+
+pub(crate) fn hex_decode_into(hex: &str, out: &mut [u8]) -> bool {
+    let digits = hex_digits(hex);
+    if digits.len() != out.len() * 2 {
+        return false;
+    }
+    for (byte, pair) in out.iter_mut().zip(digits.chunks(2)) {
+        match hex_pair(pair) {
+            Some(b) => *byte = b,
+            None => return false,
+        }
+    }
+    true
+}
+
+pub(crate) fn hex_to_bytes32(hex: &str) -> Option<[u8; 32]> {
+    let v = hex_to_vec(hex)?;
+    v.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logos_ids_canonicalize_to_lowercase_hex() {
+        let account = "8f3a2b1c4d5e6f708192a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+        let mixed = format!("logos:testnet:0x{}", account.to_uppercase());
+        let id = parse(&mixed).unwrap();
+        assert_eq!(id.namespace, "logos");
+        assert_eq!(id.account, account);
+        assert_eq!(id.canonical, format!("logos:testnet:{account}"));
+    }
+
+    #[test]
+    fn logos_reference_pins_to_lowercase_foreign_preserved() {
+        let id = parse(&format!("logos:TestNet-1:{}", "ab".repeat(32))).unwrap();
+        assert_eq!(id.canonical, format!("logos:testnet-1:{}", "ab".repeat(32)));
+        assert_eq!(id.reference, "testnet-1");
+        let id = parse("eip155:59144:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6").unwrap();
+        assert!(id.canonical.starts_with("eip155:59144:0xB9cd"));
+        assert_eq!(id.reference, "59144");
+        let id = parse("eip155:Foo:0xB9cd").unwrap();
+        assert_eq!(id.reference, "Foo", "a foreign reference keeps its case");
+    }
+
+    #[test]
+    fn unsupported_namespace_parses_but_stays_verbatim() {
+        let id = parse("eip155:59144:0xB9cd878C90E49F797B4431fBF4fb333108CB90e6").unwrap();
+        assert_eq!(id.namespace, "eip155");
+        assert_eq!(id.account, "0xB9cd878C90E49F797B4431fBF4fb333108CB90e6");
+    }
+
+    #[test]
+    fn malformed_ids_are_rejected() {
+        assert!(parse("logos:testnet").is_err());
+        assert!(parse("logos:testnet:extra:deadbeef").is_err());
+        assert!(parse(&format!("logos:testnet:{}", "ab".repeat(31))).is_err());
+        assert!(parse(&format!("logos:testnet:zz{}", "ab".repeat(31))).is_err());
+        assert!(parse(&format!("LOGOS:testnet:{}", "ab".repeat(32))).is_err());
+        assert!(parse(&format!("xy:testnet:{}", "ab".repeat(32))).is_err());
+        assert!(parse(&format!("logos::{}", "ab".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn membership_hash_matches_frozen_vector() {
+        let registry =
+            "logos:testnet:8f3a2b1c4d5e6f708192a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4";
+        assert_eq!(
+            membership_hash(registry, &[0x11u8; 32]),
+            "400683426fc56e13d6f7b6cf8b31a825ab4356ac294ef98f91784514c5cbfc08"
+        );
+    }
+
+    #[test]
+    fn hex_roundtrip() {
+        assert_eq!(hex_to_vec("0xAbCd").unwrap(), vec![0xab, 0xcd]);
+        assert_eq!(hex_to_vec(" 00ff ").unwrap(), vec![0x00, 0xff]);
+        assert!(hex_to_vec("abc").is_none());
+        assert!(hex_to_bytes32(&"ab".repeat(31)).is_none());
+        assert_eq!(bytes_to_hex(&[0xab, 0xcd]), "abcd");
+    }
+
+    #[test]
+    fn hex_decode_into_matches_hex_to_bytes32() {
+        let digits = "0123456789abcdefABCDEF".repeat(3);
+        let full = &digits[..64];
+        let cases = [
+            full.to_string(),
+            format!("0x{full}"),
+            format!("0X{full}"),
+            format!("  {full}\n"),
+            full[..62].to_string(),
+            format!("{full}00"),
+            format!("{}g", &full[..63]),
+            format!("{}é", &full[..62]),
+            String::new(),
+        ];
+        for case in &cases {
+            let mut out = [0u8; 32];
+            let ok = hex_decode_into(case, &mut out);
+            assert_eq!(ok, hex_to_bytes32(case).is_some(), "{case:?}");
+            if ok {
+                assert_eq!(Some(out), hex_to_bytes32(case), "{case:?}");
+            }
+        }
+    }
+}

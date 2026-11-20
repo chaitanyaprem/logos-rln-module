@@ -1,0 +1,13 @@
+; membership_allocation_client_module contract: the allocation client this
+; module drives for delegated registration. A verbatim copy of the contract
+; logos-membership-allocation-client-module derives from its trait
+; (rust-lib/generated/membership_allocation_client_module.lidl after
+; `nix run .#generate` there). Wired via metadata.json dependency_overrides;
+; tools/check-dep-lidl.sh compares it with a sibling checkout.
+module membership_allocation_client_module {
+  version "0.1.0"
+  depends []
+
+  method request(args_json: tstr) -> tstr description "Ask an allocator to register a membership. Args\n`{config?, identityCommitment, rate?, authType?, authPayload?,\n authProvider?, authArgs?, discover?, allocatorPeerId?,\n allocatorMultiaddr?}`.\nconfig names the registry (ConfigState account). Allocators\nadvertising the (registry, authType) pair through libp2p service\ndiscovery are asked first (discover, default true; needs config and a\nnode with discovery mounted) while none has acted on the request; the\nconfigured allocatorPeerId+allocatorMultiaddr pair, if any, comes\nafter them. authType names the auth vector: any type the target\nallocator's authVerifiers accept; this module knows no vector by\nname. Its payload comes from authPayload (raw hex, verbatim) or an\nauthProvider module implementing the auth_vector producer contract\n(authArgs forwarded verbatim); an authType with neither is a vector\nthat needs no payload. No authType at all is an unauthenticated\nrequest for an open allocator\n→ `{leaf_index, id_commitment, config_account, allocatorPeerId,\n discovered, tx_hash?}`.\nA failure is `{kind, error, reason?, allocatorPeerId?, discovered?,\n unconfirmed?, discovery?}`. kind is what to branch on:\ninvalid_request (arguments refused here), auth_failed (the\nauthProvider could not produce the payload), no_provider (no\nallocator read the request; discovery says why: unavailable,\nnot_joined or none_advertising), refused (an allocator refused;\nreason is its code), not_submitted (authorised, nothing reached the\nchain), unconfirmed (submitted, may still land; `unconfirmed: true`),\nfailed (a reply that could not be used). allocatorPeerId and\ndiscovered name the allocator whose own reply ended the request."
+  method discover(args_json: tstr) -> tstr description "The allocators currently advertising a (registry, authType) pair\nthrough libp2p service discovery. Args `{config, authType?}`\n→ `{serviceId, candidates:[{peerId, addrs}], joined, peers}`:\ncandidates is empty when none is placed yet or this node joined no\npeer within 20 s (`joined` false); `peers` is its outbound peer count.\nA node that cannot discover answers `{kind: \"no_provider\", error}`."
+}

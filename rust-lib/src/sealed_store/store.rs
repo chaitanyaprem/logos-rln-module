@@ -1,0 +1,2846 @@
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+
+use zeroize::Zeroizing;
+
+use crate::error::{ApiError, ErrorKind};
+use crate::lifecycle::{
+    CacheFile, CacheFileRef, CacheState, MembershipRecord, MembershipState, StoredCredential,
+};
+use crate::rate_limit::{remaining, reserve_slot, AllocError, AllocationState, EpochAllocation};
+use crate::registry_id;
+use crate::registry_id::{bytes_to_hex, hex_to_vec};
+use crate::sealed_store::crypto::{self, KdfParams, MasterKey, SubKeys};
+use crate::sealed_store::format::{
+    self, AllocRow, AllocationsFile, IdentityBlock, SealedEntry, SealedFile, Section,
+};
+use crate::sealed_store::fs;
+
+#[derive(Debug)]
+pub enum OpenError {
+    DirLockHeld(String),
+    OldFormatPresent(String),
+    Unreadable(String),
+}
+
+impl core::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            OpenError::DirLockHeld(m)
+            | OpenError::OldFormatPresent(m)
+            | OpenError::Unreadable(m) => f.write_str(m),
+        }
+    }
+}
+
+enum StoreCell {
+    Unready(Cow<'static, str>),
+    Ready(Arc<Store>),
+}
+
+impl StoreCell {
+    const UNINIT: StoreCell = StoreCell::Unready(Cow::Borrowed(UNINIT_MSG));
+}
+
+static STORE: RwLock<StoreCell> = RwLock::new(StoreCell::UNINIT);
+
+pub(crate) const UNINIT_MSG: &str =
+    "store not initialized (no instance persistence path from the host, unreadable \
+     keystore, or another process holds the keystore lock)";
+
+pub(crate) fn current_or_cause() -> Result<Arc<Store>, ApiError> {
+    match &*STORE
+        .read()
+        .expect("invariant: no holder of the store cell runs code that can panic")
+    {
+        StoreCell::Ready(store) => Ok(Arc::clone(store)),
+        StoreCell::Unready(cause) => Err(ApiError::internal(cause.as_ref())),
+    }
+}
+
+pub(crate) fn current() -> Option<Arc<Store>> {
+    match &*STORE.read().unwrap_or_else(PoisonError::into_inner) {
+        StoreCell::Ready(store) => Some(Arc::clone(store)),
+        StoreCell::Unready(_) => None,
+    }
+}
+
+pub(crate) fn current_or_uninit() -> Result<Arc<Store>, ApiError> {
+    current().ok_or_else(|| ApiError::internal(UNINIT_MSG))
+}
+
+pub(crate) fn open_current(dir: PathBuf) {
+    let mut cell = STORE
+        .write()
+        .expect("invariant: no holder of the store cell runs code that can panic");
+    if let StoreCell::Ready(prev) = &*cell {
+        prev.close();
+    }
+    match Store::open(dir) {
+        Ok(store) => *cell = StoreCell::Ready(store),
+        Err(e) => {
+            eprintln!("store: {e}");
+            *cell = StoreCell::Unready(Cow::Owned(e.to_string()));
+        }
+    }
+}
+
+pub(crate) fn close_current(cause: String) {
+    let mut cell = STORE
+        .write()
+        .expect("invariant: no holder of the store cell runs code that can panic");
+    if let StoreCell::Ready(prev) = &*cell {
+        prev.close();
+    }
+    *cell = StoreCell::Unready(Cow::Owned(cause));
+}
+
+#[cfg(test)]
+pub(crate) fn publish(store: Option<&Arc<Store>>) {
+    *STORE.write().unwrap_or_else(PoisonError::into_inner) = match store {
+        Some(store) => StoreCell::Ready(Arc::clone(store)),
+        None => StoreCell::UNINIT,
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn withdraw(store: &Arc<Store>) {
+    let mut cell = STORE.write().unwrap_or_else(PoisonError::into_inner);
+    if matches!(&*cell, StoreCell::Ready(current) if Arc::ptr_eq(current, store)) {
+        *cell = StoreCell::UNINIT;
+    }
+}
+
+struct Session {
+    password: Zeroizing<String>,
+    keys: SubKeys,
+}
+
+struct Inner {
+    sealed: Option<SealedFile>,
+    store_uuid: Option<[u8; 16]>,
+    sections: BTreeMap<String, AllocationState>,
+    cache: BTreeMap<String, CacheState>,
+    census_quarantined: BTreeSet<String>,
+    keyed_quarantined: BTreeSet<String>,
+    session: Option<Session>,
+    raw_sections: BTreeMap<String, Section>,
+    root_mac_raw: Option<[u8; 32]>,
+    lock: Option<std::fs::File>,
+}
+
+struct Snapshot {
+    records: BTreeMap<String, Arc<MembershipRecord>>,
+}
+
+pub struct Store {
+    dir: PathBuf,
+    write: Mutex<Inner>,
+    snapshot: Mutex<Arc<Snapshot>>,
+}
+
+impl Store {
+    pub fn open(dir: PathBuf) -> Result<Arc<Store>, OpenError> {
+        match format::detect(&dir) {
+            format::FormatPresence::OldOnly => {
+                return Err(OpenError::OldFormatPresent(
+                    "an old-format RLN keystore (rln_keystore.json) was found; this version \
+                     uses a new incompatible format with no migration — back up \
+                     rln_keystore.json and move it out of the persistence dir to start fresh \
+                     (memberships must be re-registered), or run a previous module version"
+                        .to_string(),
+                ));
+            }
+            format::FormatPresence::Both => {
+                eprintln!(
+                    "sealed store: an old-format {} sits next to the sealed store; it is \
+                     ignored (never read, renamed, or deleted)",
+                    format::OLD_FORMAT_FILE
+                );
+            }
+            format::FormatPresence::Neither | format::FormatPresence::NewOnly => {}
+        }
+        let lock = match fs::acquire_dir_lock(&dir, format::LOCK_FILE) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(OpenError::DirLockHeld(format!(
+                    "could not take the exclusive keystore lock in {} ({e}); another \
+                     process may be using this persistence path",
+                    dir.display()
+                )));
+            }
+            Err(e) => {
+                return Err(OpenError::Unreadable(format!(
+                    "keystore lock file in {}: {e}",
+                    dir.display()
+                )));
+            }
+        };
+
+        let sealed = load_sealed(&dir)?;
+        let store_uuid = match &sealed {
+            Some(f) => match hex_to_vec(&f.store_uuid).and_then(|v| <[u8; 16]>::try_from(v).ok()) {
+                Some(u) => Some(u),
+                None => {
+                    return Err(OpenError::Unreadable(format!(
+                        "{} carries a store_uuid that is not 16-byte hex — refusing to \
+                         guess; restore the file from a backup",
+                        format::SEALED_FILE
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        let mut census = BTreeSet::new();
+        if let Some(f) = &sealed {
+            for (hash, entry) in &f.credentials {
+                let recomputed = registry_id::hex_to_bytes32(&entry.identity.identity_commitment)
+                    .map(|c| registry_id::membership_hash(&entry.identity.registry_id, &c));
+                if recomputed.as_deref() != Some(hash.as_str()) {
+                    eprintln!(
+                        "sealed store: entry {hash} fails membership_hash recomputation — \
+                         quarantined"
+                    );
+                    census.insert(hash.clone());
+                }
+            }
+        }
+
+        let loaded = load_allocations(&dir, sealed.as_ref(), &mut census);
+        let cache = load_cache(&dir, sealed.as_ref());
+
+        let inner = Inner {
+            sealed,
+            store_uuid,
+            sections: loaded.sections,
+            cache,
+            census_quarantined: census,
+            keyed_quarantined: BTreeSet::new(),
+            session: None,
+            raw_sections: loaded.raw_sections,
+            root_mac_raw: loaded.root_mac_raw,
+            lock: Some(lock),
+        };
+        let snapshot = build_snapshot(&inner, None);
+        Ok(Arc::new(Store {
+            dir,
+            write: Mutex::new(inner),
+            snapshot: Mutex::new(Arc::new(snapshot)),
+        }))
+    }
+
+    pub fn close(&self) {
+        let mut guard = crate::util::lock(&self.write);
+        guard.lock.take();
+        guard.session = None;
+    }
+
+    pub fn unlock(&self, password: &str) -> Result<usize, ApiError> {
+        let mut guard = crate::util::lock(&self.write);
+        let inner = &mut *guard;
+        ensure_open(inner)?;
+
+        let cred_count = inner.sealed.as_ref().map_or(0, |f| f.credentials.len());
+        if cred_count > 0
+            && inner.sealed.as_ref().is_some_and(|f| {
+                f.credentials
+                    .keys()
+                    .all(|h| inner.census_quarantined.contains(h))
+            })
+        {
+            return Err(ApiError::internal(
+                "every keystore entry is quarantined (metadata tamper or a missing/rolled-back \
+                 rln_allocations.json); restore the keystore files from a backup",
+            ));
+        }
+
+        if cred_count == 0 {
+            let params =
+                provision_params().map_err(|e| ApiError::internal(format!("kdf params: {e}")))?;
+            let keys = derive_keys(password, &params)?;
+            let uuid = match inner.store_uuid {
+                Some(u) => u,
+                None => {
+                    let mut u = [0u8; 16];
+                    getrandom::getrandom(&mut u)
+                        .map_err(|_| ApiError::internal("no CSPRNG for the store uuid"))?;
+                    u
+                }
+            };
+            let file =
+                SealedFile::provision(params, bytes_to_hex(&keys.verify[..]), bytes_to_hex(&uuid));
+            fs::write_durable_json(&self.dir, format::SEALED_FILE, &file)
+                .map_err(|e| ApiError::internal(format!("sealed store save: {e}")))?;
+            inner.sealed = Some(file);
+            inner.store_uuid = Some(uuid);
+            inner.session = Some(Session {
+                password: Zeroizing::new(password.to_string()),
+                keys,
+            });
+            self.swap_snapshot(inner);
+            return Ok(0);
+        }
+
+        let Some(sealed) = inner.sealed.as_ref() else {
+            return Err(ApiError::internal("sealed store state desynchronized"));
+        };
+        let Some(uuid) = inner.store_uuid else {
+            return Err(ApiError::internal("sealed store is not provisioned"));
+        };
+        let keys = derive_keys(password, &sealed.kdf)?;
+        let stored_verifier = hex_to_vec(&sealed.verifier).unwrap_or_default();
+        if !crypto::ct_eq(&keys.verify[..], &stored_verifier) {
+            return Err(ApiError::new(
+                ErrorKind::BadPassword,
+                "password does not open the existing keystore",
+            ));
+        }
+
+        let mut keyed = BTreeSet::new();
+        for (hash, entry) in &sealed.credentials {
+            if inner.census_quarantined.contains(hash) {
+                continue;
+            }
+            let aad = format::credential_aad(hash, &entry.identity, &uuid);
+            if !credential_opens(&keys, &aad, entry) {
+                eprintln!(
+                    "sealed store: entry {hash} fails credential authentication — quarantined"
+                );
+                keyed.insert(hash.clone());
+            }
+        }
+        for hash in sealed.credentials.keys() {
+            if inner.census_quarantined.contains(hash) || keyed.contains(hash) {
+                continue;
+            }
+            let ok = inner
+                .raw_sections
+                .get(hash)
+                .is_some_and(|s| section_mac_ok(&keys, hash, s, &uuid));
+            if !ok {
+                eprintln!(
+                    "sealed store: entry {hash} allocation section MAC is missing or fails \
+                     verification — quarantined"
+                );
+                keyed.insert(hash.clone());
+            }
+        }
+        if !inner.raw_sections.is_empty() {
+            let mut stored_macs = BTreeMap::new();
+            for (hash, s) in &inner.raw_sections {
+                if let Some(m) = registry_id::hex_to_bytes32(&s.mac) {
+                    stored_macs.insert(hash.as_str(), m);
+                }
+            }
+            let root_ok = stored_macs.len() == inner.raw_sections.len()
+                && inner.root_mac_raw.is_some_and(|stored| {
+                    let recomputed =
+                        format::mac(&keys.ledger, &format::root_mac_payload(&stored_macs, &uuid));
+                    crypto::ct_eq(&recomputed, &stored)
+                });
+            if !root_ok {
+                eprintln!(
+                    "sealed store: allocations root MAC mismatch — splice, rollback, or \
+                     structural tamper; quarantining every membership not already attributed"
+                );
+                for hash in sealed.credentials.keys() {
+                    if !inner.census_quarantined.contains(hash) {
+                        keyed.insert(hash.clone());
+                    }
+                }
+            }
+        }
+
+        let unlocked = sealed
+            .credentials
+            .keys()
+            .filter(|h| !inner.census_quarantined.contains(*h) && !keyed.contains(*h))
+            .count();
+        inner.keyed_quarantined = keyed;
+        inner.session = Some(Session {
+            password: Zeroizing::new(password.to_string()),
+            keys,
+        });
+        self.swap_snapshot(inner);
+        Ok(unlocked)
+    }
+
+    pub fn lock(&self) {
+        crate::util::lock(&self.write).session = None;
+    }
+
+    pub fn is_unlocked(&self) -> bool {
+        crate::util::lock(&self.write).session.is_some()
+    }
+
+    pub fn session_password(&self) -> Option<Zeroizing<String>> {
+        crate::util::lock(&self.write)
+            .session
+            .as_ref()
+            .map(|s| s.password.clone())
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        !self.snapshot_arc().records.is_empty()
+    }
+
+    pub fn is_provisioned(&self) -> bool {
+        crate::util::lock(&self.write).sealed.is_some()
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.dir
+    }
+
+    #[cfg(test)]
+    pub fn is_quarantined(&self, hash: &str) -> bool {
+        self.snapshot_arc()
+            .records
+            .get(hash)
+            .map(|r| r.quarantined)
+            .unwrap_or(false)
+    }
+
+    pub fn insert(
+        &self,
+        hash: &str,
+        identity: IdentityBlock,
+        credential: &StoredCredential,
+        rate_limit: u64,
+    ) -> Result<(), ApiError> {
+        let mut guard = crate::util::lock(&self.write);
+        let inner = &mut *guard;
+        ensure_open(inner)?;
+        if inner.session.is_none() {
+            return Err(ApiError::new(
+                ErrorKind::Locked,
+                "unlock_keystore before registering",
+            ));
+        }
+        let was_census_quarantined = inner.census_quarantined.remove(hash);
+        let was_keyed_quarantined = inner.keyed_quarantined.remove(hash);
+        let section_added = if was_census_quarantined || was_keyed_quarantined {
+            inner
+                .sections
+                .insert(hash.to_string(), AllocationState::default());
+            false
+        } else if inner.sections.contains_key(hash) {
+            false
+        } else {
+            inner
+                .sections
+                .insert(hash.to_string(), AllocationState::default());
+            true
+        };
+        write_allocations(&self.dir, inner)?;
+
+        let prev_cache = inner.cache.insert(
+            hash.to_string(),
+            CacheState {
+                state: MembershipState::Pending,
+                rate_limit: Some(rate_limit),
+                ..CacheState::default()
+            },
+        );
+        write_cache(&self.dir, inner)?;
+
+        let Some(session) = inner.session.as_ref() else {
+            return Err(ApiError::new(
+                ErrorKind::Locked,
+                "unlock_keystore before registering",
+            ));
+        };
+        let Some(uuid) = inner.store_uuid else {
+            return Err(ApiError::internal("sealed store is not provisioned"));
+        };
+        let plaintext = credential_plaintext(credential)
+            .map_err(|e| ApiError::internal(format!("credential serialize: {e}")))?;
+        let aad = format::credential_aad(hash, &identity, &uuid);
+        let (nonce, ct) = crypto::seal(&session.keys.seal, &aad, &plaintext)
+            .map_err(|e| ApiError::internal(format!("credential seal: {e}")))?;
+        let Some(sealed) = inner.sealed.as_mut() else {
+            return Err(ApiError::internal("sealed store is not provisioned"));
+        };
+        let prev_credential = sealed.credentials.insert(
+            hash.to_string(),
+            SealedEntry {
+                identity,
+                nonce: bytes_to_hex(&nonce),
+                ct: bytes_to_hex(&ct),
+            },
+        );
+        if let Err(e) = fs::write_durable_json(&self.dir, format::SEALED_FILE, sealed) {
+            restore_entry(&mut sealed.credentials, hash, prev_credential);
+            restore_entry(&mut inner.cache, hash, prev_cache);
+            if section_added {
+                inner.sections.remove(hash);
+            }
+            if was_census_quarantined {
+                inner.census_quarantined.insert(hash.to_string());
+            }
+            if was_keyed_quarantined {
+                inner.keyed_quarantined.insert(hash.to_string());
+            }
+            return Err(ApiError::internal(format!("sealed store save: {e}")));
+        }
+        self.swap_snapshot(inner);
+        Ok(())
+    }
+
+    pub fn unseal_credential(&self, hash: &str) -> Result<StoredCredential, ApiError> {
+        let guard = crate::util::lock(&self.write);
+        let inner = &*guard;
+        if inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash) {
+            return Err(ApiError::internal("entry quarantined (metadata tamper)"));
+        }
+        let Some(session) = inner.session.as_ref() else {
+            return Err(ApiError::new(
+                ErrorKind::Locked,
+                "unlock_keystore before selecting",
+            ));
+        };
+        let entry = inner
+            .sealed
+            .as_ref()
+            .and_then(|f| f.credentials.get(hash))
+            .ok_or_else(|| {
+                ApiError::new(ErrorKind::UnknownMembership, "no such membership_hash")
+            })?;
+        let Some(uuid) = inner.store_uuid else {
+            return Err(ApiError::internal("sealed store is not provisioned"));
+        };
+        let aad = format::credential_aad(hash, &entry.identity, &uuid);
+        let nonce = hex_to_vec(&entry.nonce)
+            .ok_or_else(|| ApiError::internal("malformed credential nonce"))?;
+        let ct = hex_to_vec(&entry.ct)
+            .ok_or_else(|| ApiError::internal("malformed credential ciphertext"))?;
+        let plaintext =
+            crypto::unseal(&session.keys.seal, &nonce, &aad, &ct).map_err(|e| match e {
+                crypto::CryptoError::BadPassword => ApiError::new(
+                    ErrorKind::BadPassword,
+                    "session password no longer opens this entry",
+                ),
+                other => ApiError::internal(format!("credential unseal: {other}")),
+            })?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| ApiError::internal(format!("credential parse: {e}")))
+    }
+
+    pub fn membership(&self, hash: &str) -> Option<Arc<MembershipRecord>> {
+        self.snapshot_arc().records.get(hash).map(Arc::clone)
+    }
+
+    pub fn records_for(&self, canonical_registry: &str) -> Vec<Arc<MembershipRecord>> {
+        self.snapshot_arc()
+            .records
+            .values()
+            .filter(|r| r.identity.registry_id == canonical_registry)
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub fn any_for_registry(
+        &self,
+        canonical_registry: &str,
+        pred: impl Fn(&MembershipRecord) -> bool,
+    ) -> bool {
+        self.snapshot_arc()
+            .records
+            .values()
+            .any(|r| r.identity.registry_id == canonical_registry && pred(r))
+    }
+
+    pub fn pending_records(&self) -> Vec<Arc<MembershipRecord>> {
+        self.snapshot_arc()
+            .records
+            .values()
+            .filter(|r| awaits_confirmation(r))
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.snapshot_arc()
+            .records
+            .values()
+            .any(|r| awaits_confirmation(r))
+    }
+
+    pub fn refreshable_records(&self) -> Vec<Arc<MembershipRecord>> {
+        self.snapshot_arc()
+            .records
+            .values()
+            .filter(|r| {
+                !r.quarantined
+                    && matches!(
+                        r.cache.state,
+                        MembershipState::Active
+                            | MembershipState::GracePeriod
+                            | MembershipState::Expired
+                            | MembershipState::Unknown
+                    )
+            })
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub fn epoch_size_bindings(&self) -> Vec<Arc<MembershipRecord>> {
+        self.snapshot_arc()
+            .records
+            .values()
+            .map(Arc::clone)
+            .collect()
+    }
+
+    pub fn update_cache(
+        &self,
+        hash: &str,
+        f: impl FnOnce(&mut CacheState),
+    ) -> Result<MembershipState, ApiError> {
+        let mut guard = crate::util::lock(&self.write);
+        let inner = &mut *guard;
+        ensure_open(inner)?;
+        if !inner
+            .sealed
+            .as_ref()
+            .is_some_and(|s| s.credentials.contains_key(hash))
+        {
+            return Err(ApiError::new(
+                ErrorKind::UnknownMembership,
+                "no such membership_hash",
+            ));
+        }
+        let row = inner.cache.entry(hash.to_string()).or_default();
+        let prior = row.state;
+        f(row);
+        if row.first_active_at.is_none() && row.state.is_active_like() {
+            row.first_active_at = Some(crate::util::now_unix());
+        }
+        write_cache(&self.dir, inner)?;
+        self.swap_snapshot(inner);
+        Ok(prior)
+    }
+
+    pub fn reserve_message_id(
+        &self,
+        hash: &str,
+        rln_identifier_hex: &str,
+        epoch: u64,
+        retain_floor: u64,
+        rate_limit: u64,
+        epoch_size_sec: u64,
+    ) -> Result<u64, ApiError> {
+        let mut guard = crate::util::lock(&self.write);
+        let inner = &mut *guard;
+        ensure_open(inner)?;
+        if inner.session.is_none() {
+            return Err(ApiError::new(
+                ErrorKind::Locked,
+                "unlock_keystore before generate_proof",
+            ));
+        }
+        let quarantined =
+            inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+        reservation_guards(quarantined, inner.sections.get(hash), epoch_size_sec)?;
+        let Some(alloc) = inner.sections.get_mut(hash) else {
+            return Err(ApiError::new(
+                ErrorKind::UnknownMembership,
+                "no such membership_hash",
+            ));
+        };
+        let row_exists = alloc
+            .allocations
+            .iter()
+            .any(|a| a.rln_identifier == rln_identifier_hex && a.epoch == epoch);
+        if !row_exists && alloc.allocations.len() >= WRITE_ROW_CAP {
+            return Err(ApiError::new(
+                ErrorKind::Permanent,
+                "allocation section is full (too many distinct rln_identifier/epoch rows); \
+                 register a fresh membership",
+            ));
+        }
+        let slot = reserve_slot(alloc, rln_identifier_hex, epoch, retain_floor, rate_limit)
+            .map_err(|e| match e {
+                AllocError::BudgetExhausted => ApiError::new(
+                    ErrorKind::BudgetExhausted,
+                    "epoch rate-limit budget exhausted; retry next epoch",
+                ),
+                AllocError::EpochBelowFloor => floor_refusal(),
+            })?;
+        alloc.epoch_size_sec = epoch_size_sec;
+        let written = write_allocations(&self.dir, inner);
+        self.swap_snapshot(inner);
+        written?;
+        Ok(slot)
+    }
+
+    pub fn remaining_budget(
+        &self,
+        hash: &str,
+        rln_identifier_hex: &str,
+        epoch: u64,
+        rate_limit: u64,
+        epoch_size_sec: u64,
+    ) -> Result<u64, ApiError> {
+        let guard = crate::util::lock(&self.write);
+        let inner = &*guard;
+        if !inner
+            .sealed
+            .as_ref()
+            .is_some_and(|f| f.credentials.contains_key(hash))
+        {
+            return Ok(0);
+        }
+        let quarantined =
+            inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+        let default = AllocationState::default();
+        let alloc = inner.sections.get(hash).unwrap_or(&default);
+        reservation_guards(quarantined, Some(alloc), epoch_size_sec)?;
+        if epoch < alloc.prune_floor {
+            return Err(floor_refusal());
+        }
+        Ok(remaining(
+            &alloc.allocations,
+            rln_identifier_hex,
+            epoch,
+            rate_limit,
+        ))
+    }
+
+    fn snapshot_arc(&self) -> Arc<Snapshot> {
+        Arc::clone(&crate::util::lock(&self.snapshot))
+    }
+
+    fn swap_snapshot(&self, inner: &Inner) {
+        let next = build_snapshot(inner, Some(&self.snapshot_arc()));
+        *crate::util::lock(&self.snapshot) = Arc::new(next);
+    }
+}
+
+fn provision_params() -> Result<KdfParams, crypto::CryptoError> {
+    #[cfg(test)]
+    {
+        Ok(KdfParams::fast_for_tests())
+    }
+    #[cfg(not(test))]
+    {
+        KdfParams::generate()
+    }
+}
+
+fn derive_keys(password: &str, params: &KdfParams) -> Result<SubKeys, ApiError> {
+    let mk =
+        MasterKey::derive(password, params).map_err(|e| ApiError::internal(format!("kdf: {e}")))?;
+    SubKeys::derive(&mk).map_err(|e| ApiError::internal(format!("kdf: {e}")))
+}
+
+fn credential_plaintext(
+    credential: &StoredCredential,
+) -> Result<Zeroizing<Vec<u8>>, serde_json::Error> {
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut len = ByteCount(0);
+    serde_json::to_writer(&mut len, credential)?;
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(len.0));
+    serde_json::to_writer(&mut *plaintext, credential)?;
+    Ok(plaintext)
+}
+
+fn credential_opens(keys: &SubKeys, aad: &[u8], entry: &SealedEntry) -> bool {
+    let Some(nonce) = hex_to_vec(&entry.nonce) else {
+        return false;
+    };
+    let Some(ct) = hex_to_vec(&entry.ct) else {
+        return false;
+    };
+    match crypto::unseal(&keys.seal, &nonce, aad, &ct) {
+        Ok(pt) => serde_json::from_slice::<StoredCredential>(&pt).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn section_mac_ok(keys: &SubKeys, hash: &str, section: &Section, uuid: &[u8; 16]) -> bool {
+    let expected = format::mac(
+        &keys.ledger,
+        &format::section_mac_payload(
+            hash,
+            section.epoch_size_sec,
+            section.prune_floor,
+            &section.allocations,
+            uuid,
+        ),
+    );
+    match hex_to_vec(&section.mac) {
+        Some(stored) => crypto::ct_eq(&expected, &stored),
+        None => false,
+    }
+}
+
+fn ensure_open(inner: &Inner) -> Result<(), ApiError> {
+    if inner.lock.is_none() {
+        return Err(ApiError::internal("keystore is closed"));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+const WRITE_ROW_CAP: usize = format::MAX_ROWS_PER_SECTION;
+#[cfg(test)]
+const WRITE_ROW_CAP: usize = 8;
+
+fn reservation_guards(
+    quarantined: bool,
+    alloc: Option<&AllocationState>,
+    epoch_size_sec: u64,
+) -> Result<(), ApiError> {
+    if quarantined {
+        return Err(ApiError::internal("entry quarantined (metadata tamper)"));
+    }
+    let Some(alloc) = alloc else {
+        return Err(ApiError::new(
+            ErrorKind::UnknownMembership,
+            "no such membership_hash",
+        ));
+    };
+    if alloc.epoch_size_sec != 0 && alloc.epoch_size_sec != epoch_size_sec {
+        return Err(ApiError::new(
+            ErrorKind::Permanent,
+            format!(
+                "configured epoch_size_sec {epoch_size_sec} differs from {} — the size this \
+                 membership's allocations are bound to; a rebased epoch numbering could \
+                 reissue spent slots. Register a fresh membership under the new size",
+                alloc.epoch_size_sec
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn floor_refusal() -> ApiError {
+    ApiError::new(
+        ErrorKind::Permanent,
+        "epoch is below the persisted allocation floor (backwards clock step or a \
+         widened max_epoch_gap re-admitted a pruned epoch); refusing to reissue a \
+         possibly spent slot",
+    )
+}
+
+fn quarantine_file(dir: &Path, file_name: &str, why: &str) {
+    let bad = dir.join(format!("{file_name}.bad.{}", crate::util::now_unix()));
+    eprintln!(
+        "sealed store: {file_name} corrupt ({why}); attempting to move aside to {}",
+        bad.display()
+    );
+    if let Err(re) = std::fs::rename(dir.join(file_name), &bad) {
+        eprintln!("sealed store: quarantine rename failed ({re}); bad file left in place");
+    }
+}
+
+fn quarantine_all(sealed: Option<&SealedFile>, census: &mut BTreeSet<String>, why: &str) {
+    let Some(f) = sealed else { return };
+    if f.credentials.is_empty() {
+        return;
+    }
+    eprintln!("sealed store: {why}; quarantining every membership");
+    for hash in f.credentials.keys() {
+        census.insert(hash.clone());
+    }
+}
+
+fn load_sealed(dir: &Path) -> Result<Option<SealedFile>, OpenError> {
+    let path = dir.join(format::SEALED_FILE);
+    match format::file_within_cap(&path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(OpenError::Unreadable(format!(
+                "{} exceeds the {}-byte size cap; refusing to parse it — restore the file \
+                 from a backup",
+                format::SEALED_FILE,
+                format::MAX_FILE_BYTES
+            )));
+        }
+        Err(e) => {
+            return Err(OpenError::Unreadable(format!(
+                "{}: {e}",
+                format::SEALED_FILE
+            )));
+        }
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(OpenError::Unreadable(format!(
+                "{}: {e}",
+                format::SEALED_FILE
+            )));
+        }
+    };
+    let parsed = serde_json::from_str::<SealedFile>(&raw)
+        .map_err(|e| e.to_string())
+        .and_then(|f| {
+            format::check_sealed_caps(&f)
+                .map(|()| f)
+                .map_err(String::from)
+        });
+    let file = match parsed {
+        Ok(f) => f,
+        Err(e) => {
+            quarantine_file(dir, format::SEALED_FILE, &e);
+            return Ok(None);
+        }
+    };
+    if file.format != format::FORMAT_SEALED || file.version != format::FORMAT_VERSION {
+        return Err(OpenError::Unreadable(format!(
+            "{} declares format \"{}\" version {} but this build speaks {} version {}; \
+             refusing to adopt it — run a module version matching the file, or restore \
+             the file from a backup",
+            format::SEALED_FILE,
+            file.format,
+            file.version,
+            format::FORMAT_SEALED,
+            format::FORMAT_VERSION
+        )));
+    }
+    Ok(Some(file))
+}
+
+fn awaits_confirmation(r: &MembershipRecord) -> bool {
+    !r.quarantined && r.cache.state == MembershipState::Pending
+}
+
+struct LoadedAllocations {
+    sections: BTreeMap<String, AllocationState>,
+    raw_sections: BTreeMap<String, Section>,
+    root_mac_raw: Option<[u8; 32]>,
+}
+
+impl LoadedAllocations {
+    fn empty() -> LoadedAllocations {
+        LoadedAllocations {
+            sections: BTreeMap::new(),
+            raw_sections: BTreeMap::new(),
+            root_mac_raw: None,
+        }
+    }
+}
+
+fn load_allocations(
+    dir: &Path,
+    sealed: Option<&SealedFile>,
+    census: &mut BTreeSet<String>,
+) -> LoadedAllocations {
+    let path = dir.join(format::ALLOCATIONS_FILE);
+    match format::file_within_cap(&path) {
+        Ok(true) => {}
+        Ok(false) => {
+            quarantine_file(dir, format::ALLOCATIONS_FILE, "over the size cap");
+            quarantine_all(sealed, census, "the allocations file exceeded the size cap");
+            return LoadedAllocations::empty();
+        }
+        Err(e) => {
+            quarantine_all(
+                sealed,
+                census,
+                &format!("the allocations file metadata is unreadable ({e})"),
+            );
+            return LoadedAllocations::empty();
+        }
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            quarantine_all(
+                sealed,
+                census,
+                "the allocations file is missing while credentials exist (deleting the \
+                 ledger is tamper)",
+            );
+            return LoadedAllocations::empty();
+        }
+        Err(e) => {
+            quarantine_all(
+                sealed,
+                census,
+                &format!("the allocations file is unreadable ({e})"),
+            );
+            return LoadedAllocations::empty();
+        }
+    };
+    let parsed = serde_json::from_str::<AllocationsFile>(&raw)
+        .map_err(|e| e.to_string())
+        .and_then(|f| {
+            format::check_allocations_caps(&f)
+                .map(|()| f)
+                .map_err(String::from)
+        })
+        .and_then(|f| {
+            if f.format == format::FORMAT_ALLOCATIONS && f.version == format::FORMAT_VERSION {
+                Ok(f)
+            } else {
+                Err(format!(
+                    "foreign format \"{}\" version {}",
+                    f.format, f.version
+                ))
+            }
+        });
+    let file = match parsed {
+        Ok(f) => f,
+        Err(e) => {
+            quarantine_file(dir, format::ALLOCATIONS_FILE, &e);
+            quarantine_all(
+                sealed,
+                census,
+                &format!("the allocations file is corrupt ({e})"),
+            );
+            return LoadedAllocations::empty();
+        }
+    };
+    if sealed.is_none_or(|s| s.store_uuid != file.store_uuid) {
+        quarantine_all(
+            sealed,
+            census,
+            "the allocations file's store_uuid does not match the sealed header (a foreign \
+             or partially restored file)",
+        );
+        let root = registry_id::hex_to_bytes32(&file.root_mac);
+        return LoadedAllocations {
+            sections: BTreeMap::new(),
+            raw_sections: file.sections,
+            root_mac_raw: root,
+        };
+    }
+    let mut sections = BTreeMap::new();
+    if let Some(f) = sealed {
+        for (hash, section) in &file.sections {
+            if !f.credentials.contains_key(hash) {
+                eprintln!(
+                    "sealed store: allocations section {hash} has no credential — inert (a \
+                     crash-orphaned write; pruned at the next allocations write)"
+                );
+                continue;
+            }
+            sections.insert(
+                hash.clone(),
+                AllocationState {
+                    allocations: section
+                        .allocations
+                        .iter()
+                        .map(|r| EpochAllocation {
+                            rln_identifier: r.rln_identifier.clone(),
+                            epoch: r.epoch,
+                            used: r.used,
+                        })
+                        .collect(),
+                    epoch_size_sec: section.epoch_size_sec,
+                    prune_floor: section.prune_floor,
+                },
+            );
+        }
+        for hash in f.credentials.keys() {
+            if !file.sections.contains_key(hash) {
+                eprintln!(
+                    "sealed store: credential {hash} has no allocations section — quarantined"
+                );
+                census.insert(hash.clone());
+            }
+        }
+    }
+    let root = registry_id::hex_to_bytes32(&file.root_mac);
+    LoadedAllocations {
+        sections,
+        raw_sections: file.sections,
+        root_mac_raw: root,
+    }
+}
+
+fn load_cache(dir: &Path, sealed: Option<&SealedFile>) -> BTreeMap<String, CacheState> {
+    let path = dir.join(format::CACHE_FILE);
+    let mut entries = match format::file_within_cap(&path) {
+        Ok(true) => match fs::load_json::<CacheFile>(dir, format::CACHE_FILE) {
+            Ok(f) => f.entries,
+            Err(e) => {
+                eprintln!(
+                    "sealed store: {} unreadable ({e}); starting from an empty cache (the \
+                     poller heals it)",
+                    format::CACHE_FILE
+                );
+                BTreeMap::new()
+            }
+        },
+        Ok(false) => {
+            quarantine_file(dir, format::CACHE_FILE, "over the size cap");
+            BTreeMap::new()
+        }
+        Err(e) => {
+            eprintln!(
+                "sealed store: {} metadata unreadable ({e}); starting from an empty cache",
+                format::CACHE_FILE
+            );
+            BTreeMap::new()
+        }
+    };
+    match sealed {
+        Some(f) => {
+            entries.retain(|hash, _| f.credentials.contains_key(hash));
+            for hash in f.credentials.keys() {
+                entries.entry(hash.clone()).or_default();
+            }
+        }
+        None => entries.clear(),
+    }
+    entries
+}
+
+fn write_allocations(dir: &Path, inner: &mut Inner) -> Result<(), ApiError> {
+    let Some(session) = inner.session.as_ref() else {
+        return Err(ApiError::new(
+            ErrorKind::Locked,
+            "unlock_keystore before registering",
+        ));
+    };
+    let Some(uuid) = inner.store_uuid else {
+        return Err(ApiError::internal("sealed store is not provisioned"));
+    };
+    let mut sections = BTreeMap::new();
+    let mut macs = BTreeMap::new();
+    for (hash, alloc) in &inner.sections {
+        let quarantined =
+            inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+        let section = if quarantined {
+            match inner.raw_sections.get(hash) {
+                Some(s) => s.clone(),
+                None => continue,
+            }
+        } else {
+            let rows: Vec<AllocRow> = alloc
+                .allocations
+                .iter()
+                .map(|a| AllocRow {
+                    rln_identifier: a.rln_identifier.clone(),
+                    epoch: a.epoch,
+                    used: a.used,
+                })
+                .collect();
+            let mac = format::mac(
+                &session.keys.ledger,
+                &format::section_mac_payload(
+                    hash,
+                    alloc.epoch_size_sec,
+                    alloc.prune_floor,
+                    &rows,
+                    &uuid,
+                ),
+            );
+            Section {
+                epoch_size_sec: alloc.epoch_size_sec,
+                prune_floor: alloc.prune_floor,
+                allocations: rows,
+                mac: bytes_to_hex(&mac),
+            }
+        };
+        let mac_bytes = registry_id::hex_to_bytes32(&section.mac).unwrap_or([0u8; 32]);
+        macs.insert(hash.as_str(), mac_bytes);
+        sections.insert(hash.clone(), section);
+    }
+    let root = format::mac(
+        &session.keys.ledger,
+        &format::root_mac_payload(&macs, &uuid),
+    );
+    let file = AllocationsFile {
+        format: format::FORMAT_ALLOCATIONS.to_string(),
+        version: format::FORMAT_VERSION,
+        store_uuid: bytes_to_hex(&uuid),
+        sections,
+        root_mac: bytes_to_hex(&root),
+    };
+    fs::write_durable_json(dir, format::ALLOCATIONS_FILE, &file)
+        .map_err(|e| ApiError::internal(format!("allocations save: {e}")))?;
+    inner.raw_sections = file.sections;
+    inner.root_mac_raw = Some(root);
+    Ok(())
+}
+
+fn restore_entry<V>(map: &mut BTreeMap<String, V>, key: &str, prev: Option<V>) {
+    match prev {
+        Some(p) => {
+            if let Some(slot) = map.get_mut(key) {
+                *slot = p;
+            }
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
+fn write_cache(dir: &Path, inner: &Inner) -> Result<(), ApiError> {
+    let file = CacheFileRef::new(&inner.cache);
+    fs::write_atomic_loose_json(dir, format::CACHE_FILE, &file)
+        .map_err(|e| ApiError::internal(format!("cache save: {e}")))
+}
+
+fn build_snapshot(inner: &Inner, prior: Option<&Snapshot>) -> Snapshot {
+    let no_cache = CacheState::default();
+    let no_alloc = AllocationState::default();
+    let mut records = BTreeMap::new();
+    if let Some(f) = &inner.sealed {
+        for (hash, entry) in &f.credentials {
+            let cache = inner.cache.get(hash).unwrap_or(&no_cache);
+            let alloc = inner.sections.get(hash).unwrap_or(&no_alloc);
+            let quarantined =
+                inner.census_quarantined.contains(hash) || inner.keyed_quarantined.contains(hash);
+            let record = match prior.and_then(|p| p.records.get(hash)) {
+                Some(r)
+                    if r.quarantined == quarantined
+                        && r.identity == entry.identity
+                        && r.cache == *cache
+                        && r.alloc == *alloc =>
+                {
+                    Arc::clone(r)
+                }
+                _ => Arc::new(MembershipRecord {
+                    hash: hash.clone(),
+                    identity: entry.identity.clone(),
+                    cache: cache.clone(),
+                    alloc: alloc.clone(),
+                    quarantined,
+                }),
+            };
+            records.insert(hash.clone(), record);
+        }
+    }
+    Snapshot { records }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn settle_kdf() -> u64 {
+        let mut last = crypto::kdf_runs();
+        let mut stable = 0;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let now = crypto::kdf_runs();
+            if now == last {
+                stable += 1;
+                if stable >= 2 {
+                    return now;
+                }
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        last
+    }
+
+    fn test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rln-sealed-store-test-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn identity_for(registry: &str, commitment: &[u8; 32]) -> IdentityBlock {
+        IdentityBlock {
+            registry_id: registry.to_string(),
+            rln_identifier: String::new(),
+            identity_commitment: registry_id::bytes_to_hex(commitment),
+            submitted_at: crate::util::now_unix(),
+        }
+    }
+
+    fn credential_for(registry: &str, commitment: &[u8; 32]) -> StoredCredential {
+        StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(commitment),
+            identity_secret_hash: "77".repeat(32),
+            registry_id: registry.to_string(),
+        }
+    }
+
+    #[test]
+    fn credential_plaintext_is_the_json_in_one_exact_buffer() {
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let credential = credential_for(&registry, &[7; 32]);
+        let plaintext = credential_plaintext(&credential).unwrap();
+        assert_eq!(*plaintext, serde_json::to_vec(&credential).unwrap());
+        assert_eq!(plaintext.capacity(), plaintext.len(), "no reallocation");
+    }
+
+    fn insert_membership(store: &Store, registry: &str, commitment: &[u8; 32]) -> String {
+        let hash = registry_id::membership_hash(registry, commitment);
+        store
+            .insert(
+                &hash,
+                identity_for(registry, commitment),
+                &credential_for(registry, commitment),
+                100,
+            )
+            .unwrap();
+        hash
+    }
+
+    #[test]
+    fn an_unready_store_cell_surfaces_its_cause() {
+        let _serial = crate::lock(&crate::test_support::TEST_GLOBAL_LOCK);
+        publish(None);
+        let uninit = current_or_cause().err().unwrap();
+        assert_eq!(uninit.kind, ErrorKind::Internal);
+        assert_eq!(uninit.message, UNINIT_MSG);
+        close_current("re-context refused".to_string());
+        let closed = current_or_cause().err().unwrap();
+        assert_eq!(closed.kind, ErrorKind::Internal);
+        assert_eq!(closed.message, "re-context refused");
+        assert!(current().is_none());
+        publish(None);
+    }
+
+    fn edit_json(path: &Path, f: impl FnOnce(&mut serde_json::Value)) {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        f(&mut v);
+        std::fs::write(path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn has_bad_file(dir: &Path, prefix: &str) -> bool {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{prefix}.bad."))
+            })
+    }
+
+    #[test]
+    fn reservation_floor_and_epoch_size_survive_restart() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("floor");
+        let registry = format!("logos:local:{}", "aa".repeat(32));
+        let commitment = [0x66u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 12, 11, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert_eq!(
+            store
+                .epoch_size_bindings()
+                .iter()
+                .map(|r| (
+                    r.hash.clone(),
+                    r.identity.registry_id.clone(),
+                    r.alloc.epoch_size_sec
+                ))
+                .collect::<Vec<_>>(),
+            vec![(hash.clone(), registry, 600)]
+        );
+        let rewound = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
+        assert!(matches!(rewound, Err(e) if e.kind == ErrorKind::Permanent));
+        let q_floor = store.remaining_budget(&hash, "aa", 10, 5, 600);
+        assert!(matches!(q_floor, Err(e) if e.kind == ErrorKind::Permanent));
+        let q_size = store.remaining_budget(&hash, "aa", 12, 5, 1200);
+        assert!(matches!(q_size, Err(e) if e.kind == ErrorKind::Permanent));
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 12, 11, 5, 600)
+                .unwrap(),
+            1
+        );
+        let rebased = store.reserve_message_id(&hash, "aa", 12, 11, 5, 1200);
+        assert!(matches!(rebased, Err(e) if e.kind == ErrorKind::Permanent));
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_cache_updates_do_not_invalidate() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("locked-cache");
+        let registry = format!("logos:local:{}", "cc".repeat(32));
+        let commitment = [0x61u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.lock();
+        store
+            .update_cache(&hash, |c| c.leaf_index = Some(7))
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Active)
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.rate_limit = Some(100))
+            .unwrap();
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            1,
+            "no membership may be quarantined"
+        );
+        assert!(!store.is_quarantined(&hash));
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(rec.cache.state, MembershipState::Active);
+        assert_eq!(rec.cache.leaf_index, Some(7));
+        assert_eq!(rec.cache.rate_limit, Some(100));
+        assert!(
+            rec.cache.first_active_at.is_some(),
+            "active observation must stamp it"
+        );
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            1
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn census_and_unlock_matrix() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("census");
+        let registry = format!("logos:local:{}", "cd".repeat(32));
+        let commitment_a = [0x51u8; 32];
+        let commitment_b = [0x52u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        assert_eq!(store.records_for(&registry).len(), 2);
+        store.close();
+        drop(store);
+
+        let sealed_path = dir.join(format::SEALED_FILE);
+        edit_json(&sealed_path, |v| {
+            v["credentials"][hash_a.as_str()]["identity"]["identity_commitment"] =
+                "ff".repeat(32).into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.is_quarantined(&hash_a));
+        assert!(!store.is_quarantined(&hash_b));
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert!(store.unseal_credential(&hash_b).is_ok());
+        let denied = store.unseal_credential(&hash_a);
+        assert!(matches!(denied, Err(ref e) if e.message.contains("quarantined")));
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        let bad = store.unlock("not-pw");
+        assert!(matches!(bad, Err(e) if e.kind == ErrorKind::BadPassword));
+        store.close();
+        drop(store);
+
+        edit_json(&sealed_path, |v| {
+            v["credentials"][hash_b.as_str()]["identity"]["identity_commitment"] =
+                "ee".repeat(32).into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        let before = settle_kdf();
+        for pw in ["pw", "other", ""] {
+            let denied = store.unlock(pw);
+            assert!(
+                matches!(denied, Err(ref e) if e.kind == ErrorKind::Internal
+                    && e.message.contains("quarantined")),
+                "an all-quarantined store must refuse every password: {denied:?}"
+            );
+        }
+        assert_eq!(
+            crypto::kdf_runs(),
+            before,
+            "the refusal must precede any KDF"
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tampered_allocations_matrix() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("alloc-tamper");
+        let registry = format!("logos:local:{}", "bb".repeat(32));
+        let commitment_a = [0x51u8; 32];
+        let commitment_b = [0x52u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        let alloc_path = dir.join(format::ALLOCATIONS_FILE);
+        let honest = std::fs::read_to_string(&alloc_path).unwrap();
+
+        edit_json(&alloc_path, |v| {
+            v["sections"][hash_a.as_str()]["allocations"][0]["used"] = 0.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert!(
+            store.is_quarantined(&hash_a),
+            "a rewound counter must quarantine"
+        );
+        assert!(
+            !store.is_quarantined(&hash_b),
+            "the untampered sibling stays usable"
+        );
+        assert!(store.unseal_credential(&hash_a).is_err());
+        assert!(store.unseal_credential(&hash_b).is_ok());
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        edit_json(&alloc_path, |v| {
+            v["sections"][hash_a.as_str()]["mac"] = "".into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 0);
+        assert!(
+            store.is_quarantined(&hash_a),
+            "a stripped MAC must quarantine"
+        );
+        assert!(
+            store.is_quarantined(&hash_b),
+            "a broken root binding fails closed store-wide"
+        );
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            1
+        );
+        store.close();
+        drop(store);
+        let old: serde_json::Value = serde_json::from_str(&honest).unwrap();
+        edit_json(&alloc_path, |v| {
+            v["sections"][hash_a.as_str()] = old["sections"][hash_a.as_str()].clone();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            0,
+            "a splice must quarantine everything"
+        );
+        assert!(store.is_quarantined(&hash_a));
+        assert!(store.is_quarantined(&hash_b));
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        std::fs::remove_file(&alloc_path).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.is_quarantined(&hash_a));
+        assert!(store.is_quarantined(&hash_b));
+        let denied = store.unlock("pw");
+        assert!(matches!(denied, Err(ref e) if e.message.contains("quarantined")));
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        edit_json(&alloc_path, |v| {
+            v["sections"]
+                .as_object_mut()
+                .unwrap()
+                .remove(hash_a.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(
+            store.is_quarantined(&hash_a),
+            "a credential with no section census-quarantines at open"
+        );
+        assert_eq!(store.unlock("pw").unwrap(), 0);
+        assert!(
+            store.is_quarantined(&hash_b),
+            "a broken root binding fails closed store-wide"
+        );
+        assert!(store.unseal_credential(&hash_b).is_err());
+        store.close();
+        drop(store);
+        std::fs::write(&alloc_path, &honest).unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            1
+        );
+        store.close();
+        drop(store);
+        let old: serde_json::Value = serde_json::from_str(&honest).unwrap();
+        edit_json(&alloc_path, |v| {
+            v["sections"][hash_a.as_str()] = old["sections"][hash_a.as_str()].clone();
+            v["sections"][hash_b.as_str()]["prune_floor"] = 999u64.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            0,
+            "a splice behind a decoy must still be caught"
+        );
+        assert!(
+            store.is_quarantined(&hash_a),
+            "the spliced entry must not ride through B's quarantine"
+        );
+        assert!(store.is_quarantined(&hash_b));
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reservation_refuses_growth_past_the_write_row_cap() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("row-cap");
+        let registry = format!("logos:local:{}", "cc".repeat(32));
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &[0x71u8; 32]);
+        for i in 0..WRITE_ROW_CAP {
+            let rid = format!("{i:02x}");
+            assert_eq!(
+                store
+                    .reserve_message_id(&hash, &rid, 10, 9, 5, 600)
+                    .unwrap(),
+                0
+            );
+        }
+        let over = store.reserve_message_id(&hash, "ff", 10, 9, 5, 600);
+        assert!(
+            matches!(over, Err(ref e) if e.kind == ErrorKind::Permanent),
+            "a new row past the cap is refused"
+        );
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "00", 10, 9, 5, 600)
+                .unwrap(),
+            1
+        );
+        store.close();
+        drop(store);
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(
+            !store.is_quarantined(&hash),
+            "the capped file must remain readable"
+        );
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_open_is_refused_while_the_first_holds_the_lock() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("dir-lock");
+        let first = Store::open(dir.clone()).unwrap();
+        let second = Store::open(dir.clone());
+        assert!(
+            matches!(second, Err(OpenError::DirLockHeld(_))),
+            "the second opener fails closed"
+        );
+        first.close();
+        Store::open(dir.clone()).unwrap().close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_closed_store_refuses_writes() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("closed-writes");
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        store.close();
+        assert!(matches!(store.unlock("pw"), Err(ref e) if e.message.contains("closed")));
+        assert!(
+            matches!(store.update_cache("00", |_| {}), Err(ref e) if e.message.contains("closed"))
+        );
+        assert!(
+            matches!(store.reserve_message_id("00", "aa", 10, 9, 5, 600), Err(ref e) if e.message.contains("closed"))
+        );
+        assert!(store.session_password().is_none());
+        assert!(matches!(store.unseal_credential("00"), Err(ref e) if e.kind == ErrorKind::Locked));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_quarantined_store_is_not_fresh() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("not-fresh");
+        let registry = format!("logos:local:{}", "ef".repeat(32));
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &[0x44u8; 32]);
+        store.close();
+        drop(store);
+        std::fs::remove_file(dir.join(format::ALLOCATIONS_FILE)).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.is_quarantined(&hash));
+        assert!(
+            store.has_credentials(),
+            "an all-quarantined store must not look fresh"
+        );
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_store_verifier_flow() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("verifier");
+        let registry = format!("logos:local:{}", "ee".repeat(32));
+        let commitment = [0x42u8; 32];
+        let sealed_path = dir.join(format::SEALED_FILE);
+        let uuid_of = |p: &Path| read_json(p)["store_uuid"].as_str().unwrap().to_string();
+
+        let store = Store::open(dir.clone()).unwrap();
+        let before = settle_kdf();
+        assert_eq!(store.unlock("pw1").unwrap(), 0);
+        assert_eq!(
+            crypto::kdf_runs(),
+            before + 1,
+            "provisioning is exactly one KDF run"
+        );
+        let uuid1 = uuid_of(&sealed_path);
+        store.lock();
+
+        let before = crypto::kdf_runs();
+        assert_eq!(store.unlock("pw2").unwrap(), 0);
+        assert_eq!(crypto::kdf_runs(), before + 1);
+        assert_eq!(
+            uuid_of(&sealed_path),
+            uuid1,
+            "re-provisioning must keep the uuid"
+        );
+
+        let hash = insert_membership(&store, &registry, &commitment);
+        store.lock();
+        let before = crypto::kdf_runs();
+        let denied = store.unlock("pw1");
+        assert!(matches!(denied, Err(e) if e.kind == ErrorKind::BadPassword));
+        assert_eq!(
+            crypto::kdf_runs(),
+            before + 1,
+            "a verify is exactly one KDF run"
+        );
+        let before = crypto::kdf_runs();
+        assert_eq!(store.unlock("pw2").unwrap(), 1);
+        assert_eq!(crypto::kdf_runs(), before + 1);
+        assert!(store.unseal_credential(&hash).is_ok());
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_orphans_and_reinsert() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("orphans");
+        let registry = format!("logos:local:{}", "ab".repeat(32));
+        let commitment_a = [0x51u8; 32];
+        let commitment_b = [0x52u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        edit_json(&dir.join(format::SEALED_FILE), |v| {
+            v["credentials"]
+                .as_object_mut()
+                .unwrap()
+                .remove(hash_b.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "an orphan is not a membership"
+        );
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            1,
+            "the orphan must not quarantine A"
+        );
+        assert!(!store.is_quarantined(&hash_a));
+
+        store
+            .insert(
+                &hash_a,
+                identity_for(&registry, &commitment_a),
+                &credential_for(&registry, &commitment_a),
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            1
+        );
+
+        let alloc = read_json(&dir.join(format::ALLOCATIONS_FILE));
+        assert!(alloc["sections"].get(hash_b.as_str()).is_none());
+        let cache = read_json(&dir.join(format::CACHE_FILE));
+        assert!(cache["entries"].get(hash_b.as_str()).is_none());
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_keystore_file_refuses_open_only_without_a_new_store() {
+        let _serial = crate::util::lock(&SERIAL);
+
+        let dir = test_dir("oldfmt-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old_bytes: &[u8] = b"{\"credentials\":{\"legacy\":true}}";
+        std::fs::write(dir.join(format::OLD_FORMAT_FILE), old_bytes).unwrap();
+        let denied = Store::open(dir.clone());
+        assert!(
+            matches!(denied, Err(OpenError::OldFormatPresent(ref m))
+                if m.contains("rln_keystore.json") && m.contains("no migration")),
+            "an old-only dir must refuse with migration guidance"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format::OLD_FORMAT_FILE)).unwrap(),
+            old_bytes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = test_dir("oldfmt-both");
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        store.close();
+        drop(store);
+        std::fs::write(dir.join(format::OLD_FORMAT_FILE), old_bytes).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 0);
+        assert_eq!(
+            std::fs::read(dir.join(format::OLD_FORMAT_FILE)).unwrap(),
+            old_bytes
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locked_structural_gates() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("locked-gates");
+        let registry = format!("logos:local:{}", "de".repeat(32));
+        let commitment_a = [0x51u8; 32];
+        let commitment_b = [0x52u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        store.lock();
+
+        let hash_b = registry_id::membership_hash(&registry, &commitment_b);
+        let denied = store.insert(
+            &hash_b,
+            identity_for(&registry, &commitment_b),
+            &credential_for(&registry, &commitment_b),
+            100,
+        );
+        assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
+        let denied = store.unseal_credential(&hash_a);
+        assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
+        let denied = store.reserve_message_id(&hash_a, "aa", 10, 9, 5, 600);
+        assert!(matches!(denied, Err(e) if e.kind == ErrorKind::Locked));
+        store
+            .update_cache(&hash_a, |c| c.leaf_index = Some(3))
+            .unwrap();
+        assert_eq!(store.pending_records().len(), 1);
+        assert_eq!(
+            store.remaining_budget(&hash_a, "aa", 10, 5, 600).unwrap(),
+            5
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_corruption_heals() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("cache-heal");
+        let registry = format!("logos:local:{}", "ef".repeat(32));
+        let commitment = [0x44u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        store.close();
+        drop(store);
+
+        std::fs::write(dir.join(format::CACHE_FILE), b"{not json").unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(
+            has_bad_file(&dir, format::CACHE_FILE),
+            "the corrupt cache must be moved aside as evidence"
+        );
+        let rec = store.membership(&hash).unwrap();
+        assert!(
+            !rec.quarantined,
+            "cache corruption is self-DoS, never quarantine"
+        );
+        assert_eq!(rec.cache.state, MembershipState::Unknown);
+        assert!(store.refreshable_records().iter().any(|r| r.hash == hash));
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_field_tamper_matrix() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("aad-tamper");
+        let registry = format!("logos:local:{}", "fa".repeat(32));
+        let commitment_a = [0x53u8; 32];
+        let commitment_b = [0x54u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        let sealed_path = dir.join(format::SEALED_FILE);
+        let honest = std::fs::read_to_string(&sealed_path).unwrap();
+
+        let other_registry = format!("logos:local:{}", "fb".repeat(32));
+        let cases: [(&str, serde_json::Value, bool); 4] = [
+            ("registry_id", other_registry.into(), true),
+            ("identity_commitment", "fd".repeat(32).into(), true),
+            ("rln_identifier", "de".repeat(32).into(), false),
+            ("submitted_at", 12_345.into(), false),
+        ];
+        for (field, value, census_caught) in cases {
+            edit_json(&sealed_path, |v| {
+                v["credentials"][hash_a.as_str()]["identity"][field] = value;
+            });
+            let store = Store::open(dir.clone()).unwrap();
+            assert_eq!(
+                store.is_quarantined(&hash_a),
+                census_caught,
+                "{field}: pre-unlock quarantine marks the census-caught fields"
+            );
+            assert_eq!(
+                store.unlock("pw").unwrap(),
+                1,
+                "{field}: the sibling must unlock"
+            );
+            assert!(
+                store.is_quarantined(&hash_a),
+                "{field} tamper must quarantine"
+            );
+            assert!(
+                !store.is_quarantined(&hash_b),
+                "{field}: the sibling stays usable"
+            );
+            let denied = store.unseal_credential(&hash_a);
+            assert!(
+                matches!(denied, Err(ref e) if e.message.contains("quarantined")),
+                "{field}: unseal must refuse without plaintext release"
+            );
+            assert!(store.unseal_credential(&hash_b).is_ok());
+            store.close();
+            drop(store);
+            std::fs::write(&sealed_path, &honest).unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_failure_wastes_slot_never_reissues() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("persist-fail");
+        let registry = format!("logos:local:{}", "fc".repeat(32));
+        let commitment = [0x55u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let denied = store.reserve_message_id(&hash, "aa", 10, 9, 5, 600);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(denied, Err(ref e) if e.kind == ErrorKind::Internal),
+            "{denied:?}"
+        );
+
+        assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 3);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.remaining_budget(&hash, "aa", 10, 5, 600).unwrap(), 2);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_storm_holds_the_one_write_mutex_rule() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("storm");
+        let registry = format!("logos:local:{}", "fd".repeat(32));
+        let commitment = [0x56u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+
+        let writer = {
+            let store = Arc::clone(&store);
+            let hash = hash.clone();
+            std::thread::spawn(move || {
+                let states = [
+                    MembershipState::Pending,
+                    MembershipState::Active,
+                    MembershipState::Failed,
+                ];
+                for state in states.iter().cycle().take(50) {
+                    store.update_cache(&hash, |c| c.state = *state).unwrap();
+                }
+            })
+        };
+        let mut issued = BTreeSet::new();
+        for i in 0..20u64 {
+            let epoch = 10 + i / 4;
+            let slot = store
+                .reserve_message_id(&hash, "aa", epoch, 9, 10, 600)
+                .unwrap();
+            assert!(issued.insert((epoch, slot)), "reissued ({epoch}, {slot})");
+        }
+        writer.join().unwrap();
+
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(
+            rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(),
+            20
+        );
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            1,
+            "zero quarantined after the storm"
+        );
+        assert!(!store.is_quarantined(&hash));
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(
+            rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(),
+            20
+        );
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 10, 600)
+                .unwrap(),
+            4
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcap_allocations_file_quarantines_all() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("overcap-alloc");
+        let registry = format!("logos:local:{}", "fe".repeat(32));
+        let commitment_a = [0x57u8; 32];
+        let commitment_b = [0x58u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        let mut sections = serde_json::Map::new();
+        for i in 0..=format::MAX_SECTIONS {
+            sections.insert(
+                format!("hash{i:04}"),
+                serde_json::json!({
+                    "epoch_size_sec": 600, "prune_floor": 0,
+                    "allocations": [], "mac": "00".repeat(32),
+                }),
+            );
+        }
+        let file = serde_json::json!({
+            "format": format::FORMAT_ALLOCATIONS,
+            "version": format::FORMAT_VERSION,
+            "store_uuid": "00".repeat(16),
+            "sections": sections,
+            "root_mac": "00".repeat(32),
+        });
+        std::fs::write(
+            dir.join(format::ALLOCATIONS_FILE),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::ALLOCATIONS_FILE));
+        assert!(store.is_quarantined(&hash_a));
+        assert!(store.is_quarantined(&hash_b));
+        let denied = store.unlock("pw");
+        assert!(
+            matches!(denied, Err(ref e) if e.message.contains("quarantined")),
+            "{denied:?}"
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcap_cache_file_degrades_to_defaults() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("overcap-cache");
+        let registry = format!("logos:local:{}", "df".repeat(32));
+        let commitment = [0x5du8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        store.close();
+        drop(store);
+
+        let oversize = vec![b' '; format::MAX_FILE_BYTES as usize + 1];
+        std::fs::write(dir.join(format::CACHE_FILE), oversize).unwrap();
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::CACHE_FILE));
+        let rec = store.membership(&hash).unwrap();
+        assert!(
+            !rec.quarantined,
+            "cache over-cap is self-DoS, never quarantine"
+        );
+        assert_eq!(rec.cache.state, MembershipState::Unknown);
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversize_sealed_file_refuses_open() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("oversize-sealed");
+        let registry = format!("logos:local:{}", "ea".repeat(32));
+        let commitment = [0x5eu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        insert_membership(&store, &registry, &commitment);
+        store.close();
+        drop(store);
+
+        let sealed_path = dir.join(format::SEALED_FILE);
+        edit_json(&sealed_path, |v| {
+            v["padding"] = " ".repeat(format::MAX_FILE_BYTES as usize + 1).into();
+        });
+        let denied = Store::open(dir.clone());
+        assert!(
+            matches!(denied, Err(OpenError::Unreadable(ref m)) if m.contains("size cap")),
+            "an over-cap sealed file must refuse open as Unreadable"
+        );
+        assert!(sealed_path.exists(), "the oversized file stays in place");
+        assert!(!has_bad_file(&dir, format::SEALED_FILE));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overcount_sealed_credentials_starts_fresh() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("overcount-sealed");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut credentials = serde_json::Map::new();
+        for i in 0..=format::MAX_CREDENTIALS {
+            credentials.insert(
+                format!("hash{i:04}"),
+                serde_json::json!({
+                    "identity": {
+                        "registry_id": "r", "rln_identifier": "",
+                        "identity_commitment": "11", "submitted_at": 1,
+                    },
+                    "nonce": "22".repeat(24), "ct": "33",
+                }),
+            );
+        }
+        let file = serde_json::json!({
+            "format": format::FORMAT_SEALED,
+            "version": format::FORMAT_VERSION,
+            "kdf": {"m_cost_kib": 8, "t_cost": 1, "p_cost": 1, "salt": "44".repeat(16)},
+            "verifier": "55".repeat(32),
+            "store_uuid": "66".repeat(16),
+            "credentials": credentials,
+        });
+        std::fs::write(
+            dir.join(format::SEALED_FILE),
+            serde_json::to_string(&file).unwrap(),
+        )
+        .unwrap();
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(has_bad_file(&dir, format::SEALED_FILE));
+        assert!(!store.has_credentials());
+        assert_eq!(
+            store.unlock("pw").unwrap(),
+            0,
+            "a fresh empty store provisions"
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_crash_windows_are_inert_or_healed() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("crash-windows");
+        let registry = format!("logos:local:{}", "da".repeat(32));
+        let commitment_a = [0x59u8; 32];
+        let commitment_b = [0x5au8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        store.close();
+        drop(store);
+
+        edit_json(&dir.join(format::SEALED_FILE), |v| {
+            v["credentials"]
+                .as_object_mut()
+                .unwrap()
+                .remove(hash_b.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "the orphan is not a membership"
+        );
+        assert_eq!(store.unlock("pw").unwrap(), 1, "zero quarantined");
+        assert!(!store.is_quarantined(&hash_a));
+        assert_eq!(insert_membership(&store, &registry, &commitment_b), hash_b);
+        assert!(store.unseal_credential(&hash_b).is_ok());
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_b, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        edit_json(&dir.join(format::CACHE_FILE), |v| {
+            v["entries"]
+                .as_object_mut()
+                .unwrap()
+                .remove(hash_b.as_str());
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        let rec = store.membership(&hash_b).unwrap();
+        assert!(!rec.quarantined);
+        assert_eq!(rec.cache.state, MembershipState::Unknown);
+        assert!(store.refreshable_records().iter().any(|r| r.hash == hash_b));
+        assert_eq!(store.unlock("pw").unwrap(), 2, "zero quarantined");
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_leaves_no_membership() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+        let commitment_a = [0x5cu8; 32];
+        let commitment_b = [0x5du8; 32];
+        let commitment_c = [0x5eu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let hash_b = registry_id::membership_hash(&registry, &commitment_b);
+        assert!(store
+            .insert(
+                &hash_b,
+                identity_for(&registry, &commitment_b),
+                &credential_for(&registry, &commitment_b),
+                100,
+            )
+            .is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash_a, |_| {}).unwrap();
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "an uncommitted insert is not a membership"
+        );
+        let hash_c = insert_membership(&store, &registry, &commitment_c);
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert!(store.membership(&hash_a).is_some());
+        assert!(store.membership(&hash_c).is_some());
+        assert!(
+            store.membership(&hash_b).is_none(),
+            "the failed insert was never persisted"
+        );
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn disk_section(dir: &Path, hash: &str) -> serde_json::Value {
+        read_json(&dir.join(format::ALLOCATIONS_FILE))["sections"][hash].take()
+    }
+
+    fn section_matches(alloc: &AllocationState, section: &serde_json::Value) -> bool {
+        let rows: Vec<(&str, u64, u64)> = section["allocations"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .map(|r| {
+                        (
+                            r["rln_identifier"].as_str().unwrap(),
+                            r["epoch"].as_u64().unwrap(),
+                            r["used"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mem_rows: Vec<(&str, u64, u64)> = alloc
+            .allocations
+            .iter()
+            .map(|a| (a.rln_identifier.as_str(), a.epoch, a.used))
+            .collect();
+        section["epoch_size_sec"].as_u64() == Some(alloc.epoch_size_sec)
+            && section["prune_floor"].as_u64() == Some(alloc.prune_floor)
+            && rows == mem_rows
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_over_a_quarantined_hash_keeps_memory_on_disk() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit-quarantined");
+        let registry = format!("logos:local:{}", "de".repeat(32));
+        let commitment_a = [0x5fu8; 32];
+        let commitment_b = [0x60u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash_a = insert_membership(&store, &registry, &commitment_a);
+        let hash_b = insert_membership(&store, &registry, &commitment_b);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash_a, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        store.close();
+        drop(store);
+
+        edit_json(&dir.join(format::ALLOCATIONS_FILE), |v| {
+            v["sections"][hash_a.as_str()]["allocations"][0]["used"] = 0.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        assert!(store.is_quarantined(&hash_a));
+        let untrusted = store.membership(&hash_a).unwrap();
+        assert!(
+            untrusted.alloc != AllocationState::default(),
+            "the tampered counters are distinguishable from a reset section"
+        );
+
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let retried = IdentityBlock {
+            submitted_at: 1,
+            ..identity_for(&registry, &commitment_a)
+        };
+        assert!(retried != untrusted.identity);
+        assert!(store
+            .insert(
+                &hash_a,
+                retried,
+                &credential_for(&registry, &commitment_a),
+                100,
+            )
+            .is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash_b, |_| {}).unwrap();
+        let rec = store.membership(&hash_a).unwrap();
+        assert!(
+            rec.identity == untrusted.identity,
+            "the failed insert's credential is not published"
+        );
+        assert!(rec.cache == untrusted.cache);
+        assert!(
+            rec.quarantined,
+            "the quarantine is not lifted by a failed insert"
+        );
+        assert!(
+            section_matches(&rec.alloc, &disk_section(&dir, &hash_a)),
+            "the in-memory section is the one on disk"
+        );
+
+        store.lock();
+        assert_eq!(store.unlock("pw").unwrap(), 2);
+        let rec = store.membership(&hash_a).unwrap();
+        assert!(
+            rec.alloc != untrusted.alloc,
+            "the untrusted counters are never re-verified into trust"
+        );
+        assert!(section_matches(&rec.alloc, &disk_section(&dir, &hash_a)));
+        assert!(rec.identity == untrusted.identity);
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_sealed_commit_over_an_existing_hash_keeps_the_previous_membership() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("failed-commit-existing");
+        let registry = format!("logos:local:{}", "df".repeat(32));
+        let commitment = [0x62u8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        store
+            .update_cache(&hash, |c| {
+                c.state = MembershipState::Active;
+                c.leaf_index = Some(7);
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+        let before = store.membership(&hash).unwrap();
+
+        let obstacle = dir.join(format!("{}.tmp", format::SEALED_FILE));
+        std::fs::create_dir(&obstacle).unwrap();
+        let retried = IdentityBlock {
+            submitted_at: 1,
+            ..identity_for(&registry, &commitment)
+        };
+        assert!(retried != before.identity);
+        let replacement = StoredCredential {
+            identity_commitment: registry_id::bytes_to_hex(&commitment),
+            identity_secret_hash: "88".repeat(32),
+            registry_id: registry,
+        };
+        assert!(store.insert(&hash, retried, &replacement, 200).is_err());
+        std::fs::remove_dir(&obstacle).unwrap();
+
+        store.update_cache(&hash, |_| {}).unwrap();
+        let rec = store.membership(&hash).unwrap();
+        assert!(
+            rec.identity == before.identity,
+            "the previous identity stays"
+        );
+        assert!(rec.cache == before.cache, "the previous cache row stays");
+        assert!(rec.alloc == before.alloc, "the honest counters stay");
+        assert!(!rec.quarantined);
+        assert_eq!(
+            store.unseal_credential(&hash).unwrap().identity_secret_hash,
+            "77".repeat(32),
+            "the previous credential is the one that unseals"
+        );
+        store.close();
+        drop(store);
+
+        let store = Store::open(dir.clone()).unwrap();
+        assert_eq!(store.unlock("pw").unwrap(), 1);
+        let rec = store.membership(&hash).unwrap();
+        assert!(rec.identity == before.identity);
+        assert!(rec.cache == before.cache);
+        assert_eq!(
+            store.unseal_credential(&hash).unwrap().identity_secret_hash,
+            "77".repeat(32)
+        );
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_reads_stay_consistent_during_persist() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("snapshot-reads");
+        let registry = format!("logos:local:{}", "db".repeat(32));
+        let commitment = [0x5bu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let store = Arc::clone(&store);
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let mut last_total = 0u64;
+                let mut reads = 0u64;
+                loop {
+                    let recs = store.records_for(&registry);
+                    assert_eq!(recs.len(), 1, "a snapshot is always whole");
+                    let rec = &recs[0];
+                    for row in &rec.alloc.allocations {
+                        assert!((1..=5).contains(&row.used));
+                        assert!(row.epoch >= rec.alloc.prune_floor);
+                    }
+                    let total: u64 = rec.alloc.allocations.iter().map(|a| a.used).sum();
+                    assert!(total >= last_total, "a snapshot went backwards");
+                    last_total = total;
+                    reads += 1;
+                    if done.load(Ordering::Relaxed) || reads >= 5_000_000 {
+                        return (reads, last_total);
+                    }
+                }
+            })
+        };
+        for i in 0..20u64 {
+            store
+                .reserve_message_id(&hash, "aa", 10 + i / 5, 9, 5, 600)
+                .unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let (reads, last_total) = reader.join().unwrap();
+        assert!(
+            reads > 0 && reads < 5_000_000,
+            "the reader must terminate with the writer"
+        );
+        assert!(last_total <= 20);
+        let rec = store.membership(&hash).unwrap();
+        assert_eq!(
+            rec.alloc.allocations.iter().map(|a| a.used).sum::<u64>(),
+            20
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_shares_unchanged_records_and_matches_a_full_rebuild() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("snapshot-share");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+
+        let matches_full_rebuild = |store: &Store| {
+            let inner = crate::util::lock(&store.write);
+            let full = build_snapshot(&inner, None);
+            let published = store.snapshot_arc();
+            assert_eq!(
+                published.records.keys().collect::<Vec<_>>(),
+                full.records.keys().collect::<Vec<_>>()
+            );
+            for (hash, want) in &full.records {
+                let got = &published.records[hash];
+                assert_eq!(got.hash, want.hash);
+                assert!(got.identity == want.identity, "identity of {hash}");
+                assert!(got.cache == want.cache, "cache of {hash}");
+                assert!(got.alloc == want.alloc, "alloc of {hash}");
+                assert_eq!(got.quarantined, want.quarantined, "quarantine of {hash}");
+            }
+        };
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let a = insert_membership(&store, &registry, &[0x71u8; 32]);
+        let b = insert_membership(&store, &registry, &[0x72u8; 32]);
+        matches_full_rebuild(&store);
+        let (a0, b0) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+
+        store
+            .update_cache(&a, |m| {
+                m.state = MembershipState::Active;
+                m.leaf_index = Some(3);
+            })
+            .unwrap();
+        matches_full_rebuild(&store);
+        let (a1, b1) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        assert!(!Arc::ptr_eq(&a0, &a1));
+        assert!(Arc::ptr_eq(&b0, &b1));
+        assert_eq!(a1.cache.state, MembershipState::Active);
+        assert_eq!(a1.cache.leaf_index, Some(3));
+        assert_eq!(
+            a0.cache.state,
+            MembershipState::Pending,
+            "a held record never changes"
+        );
+        assert_eq!(a0.cache.leaf_index, None);
+
+        store.reserve_message_id(&b, "aa", 10, 9, 5, 600).unwrap();
+        matches_full_rebuild(&store);
+        let (a2, b2) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&b1, &b2));
+        assert_eq!(b2.alloc.epoch_size_sec, 600);
+        assert_eq!(b1.alloc.epoch_size_sec, 0, "a held record never changes");
+
+        store.update_cache(&a, |_| {}).unwrap();
+        matches_full_rebuild(&store);
+        assert!(Arc::ptr_eq(&a2, &store.membership(&a).unwrap()));
+
+        let c = insert_membership(&store, &registry, &[0x73u8; 32]);
+        matches_full_rebuild(&store);
+        assert!(Arc::ptr_eq(&a2, &store.membership(&a).unwrap()));
+        assert!(Arc::ptr_eq(&b2, &store.membership(&b).unwrap()));
+        assert_eq!(store.records_for(&registry).len(), 3);
+        assert!(store.membership(&c).is_some());
+
+        store.close();
+        drop(store);
+        edit_json(&dir.join(format::ALLOCATIONS_FILE), |v| {
+            v["sections"][c.as_str()]["prune_floor"] = 999u64.into();
+        });
+        let store = Store::open(dir.clone()).unwrap();
+        let (a3, b3) = (store.membership(&a).unwrap(), store.membership(&b).unwrap());
+        store.unlock("pw").unwrap();
+        matches_full_rebuild(&store);
+        assert!(store.membership(&c).unwrap().quarantined);
+        assert!(Arc::ptr_eq(&a3, &store.membership(&a).unwrap()));
+        assert!(Arc::ptr_eq(&b3, &store.membership(&b).unwrap()));
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_file_bytes_are_the_owned_cache_file() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("cache-file-bytes");
+        let registry = format!("logos:local:{}", "dd".repeat(32));
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let full = insert_membership(&store, &registry, &[0x5du8; 32]);
+        let _bare = insert_membership(&store, &registry, &[0x5eu8; 32]);
+        store
+            .update_cache(&full, |c| {
+                c.state = MembershipState::Failed;
+                c.leaf_index = Some(9);
+                c.rate_limit = Some(100);
+                c.failed_reason = Some("allocation_failed: \"quoted\" \u{2014} \u{fc}".into());
+                c.retryable = Some(true);
+                c.tx_result = Some(r#"{"ok":true}"#.into());
+                c.first_active_at = Some(1);
+                c.confirm_deadline = Some(2);
+            })
+            .unwrap();
+
+        let expected = serde_json::to_string_pretty(&CacheFile {
+            entries: crate::util::lock(&store.write).cache.clone(),
+            ..CacheFile::new()
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format::CACHE_FILE)).unwrap(),
+            expected
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_updates_never_touch_covered_bytes() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("cache-bytes");
+        let registry = format!("logos:local:{}", "dc".repeat(32));
+        let commitment = [0x5cu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert_eq!(
+            store
+                .reserve_message_id(&hash, "aa", 10, 9, 5, 600)
+                .unwrap(),
+            0
+        );
+
+        let sealed_before = std::fs::read(dir.join(format::SEALED_FILE)).unwrap();
+        let alloc_before = std::fs::read(dir.join(format::ALLOCATIONS_FILE)).unwrap();
+
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Active)
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.leaf_index = Some(9))
+            .unwrap();
+        store.lock();
+        store
+            .update_cache(&hash, |c| c.rate_limit = Some(100))
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Failed)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(dir.join(format::SEALED_FILE)).unwrap(),
+            sealed_before
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format::ALLOCATIONS_FILE)).unwrap(),
+            alloc_before
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_active_at_is_monotone_through_update_cache() {
+        let _serial = crate::util::lock(&SERIAL);
+        let dir = test_dir("first-active");
+        let registry = format!("logos:local:{}", "dd".repeat(32));
+        let commitment = [0x5fu8; 32];
+
+        let store = Store::open(dir.clone()).unwrap();
+        store.unlock("pw").unwrap();
+        let hash = insert_membership(&store, &registry, &commitment);
+        assert!(store
+            .membership(&hash)
+            .unwrap()
+            .cache
+            .first_active_at
+            .is_none());
+
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Active)
+            .unwrap();
+        assert!(store
+            .membership(&hash)
+            .unwrap()
+            .cache
+            .first_active_at
+            .is_some());
+        store
+            .update_cache(&hash, |c| c.first_active_at = Some(12_345))
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Failed)
+            .unwrap();
+        store
+            .update_cache(&hash, |c| c.state = MembershipState::Active)
+            .unwrap();
+        assert_eq!(
+            store.membership(&hash).unwrap().cache.first_active_at,
+            Some(12_345),
+            "a second activation must not restamp the monotone timestamp"
+        );
+
+        store.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

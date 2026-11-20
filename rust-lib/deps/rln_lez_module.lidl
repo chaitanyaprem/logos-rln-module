@@ -1,0 +1,106 @@
+; rln_lez_module contract — the subset the membership module's lez-rln
+; registry provider consumes. Hand-maintained from
+; rust-lib/rln_lez_module.lidl in the logos-rln-lez-module repo: when either
+; side changes, update the other and bump both versions;
+; tools/check-dep-lidl.sh compares them, given a checkout of that repo. Wired
+; via metadata.json dependency_overrides; logos-lidl-gen turns it into the
+; typed RlnLezModuleClient provider.rs calls.
+module rln_lez_module {
+  version "6.1.1"
+
+  ; All replies are compact JSON strings; "" is the error value.
+
+  ; Idempotent on-chain registration; {"leaf_index":N,"pending":true,
+  ; "rate_limit":N,"tx_result":s} (leaf_index is a pre-submit ESTIMATE;
+  ; tx_result is the send result as JSON text {"error","success","tx_hash"})
+  ; or {"already_registered":true,"leaf_index":N}. A registration the program
+  ; would refuse is not submitted: {"error":"<kind>: <reason>"} with kind
+  ; invalid_commitment, invalid_rate_limit, registry_full, tree_full,
+  ; insufficient_balance or treasury_missing; a send the wallet could not make
+  ; is {"error":"send_failed: <why>"}, nothing submitted. "" is a config or
+  ; chain read that failed. A reverted or never-included registration is
+  ; re-sent by the module; this consumer watches get_membership.
+  ;
+  ; Parameter 2 is the PAYER: it signs the tx, pays rate_limit x
+  ; price_per_unit of NATIVE balance and pays the fee. "" selects the
+  ; provider's own payer, which is what this consumer passes — it is
+  ; registry-agnostic and holds no account ids.
+  method register_member(config_account_id: tstr, payer_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
+
+  ; Membership PDA read + state from chain time (the head block's timestamp
+  ; since 6.0.0; a clock account before): {"registered":false}
+  ; or {"clock_timestamp":N,"grace_period_duration":N,
+  ; "grace_period_start_timestamp":N,"leaf_index":N,"rate_limit":N,
+  ; "registered":true,"state":"active"|"grace_period"|"expired"}.
+  ; clock_timestamp and grace_period_start_timestamp are MILLISECONDS;
+  ; grace_period_duration is SECONDS.
+  method get_membership(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
+
+  ; {"active_duration":N,"current_total_rate_limit":N,
+  ;  "grace_period_duration":N,"max_rate_limit":N,"max_total_rate_limit":N,
+  ;  "min_rate_limit":N,"price_per_unit":"<decimal>","total_registrations":N}.
+  ; price_per_unit is denominated in NATIVE balance since v4.0.0;
+  ; active_duration and grace_period_duration are SECONDS.
+  method get_registry_bounds(config_account_id: tstr) -> tstr
+
+  ; JSON array of proof objects (each with valid_roots from the same tree
+  ; snapshot); "[]" for an empty index list.
+  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
+
+  ; {"depth":N,"valid_roots":[…]} — the tree depth and its 32-byte
+  ; lowercase-hex roots (current + non-zero history).
+  ;
+  ; The consumer LIFTS these to the prover circuit depth before they reach the
+  ; valid-root window, which is why the depth has to travel with them: a proof
+  ; carries a lifted root, so an unlifted window matches nothing and a node
+  ; rejects proofs it generated itself. v3.0.0 and earlier answered a bare
+  ; array. See provider::lift_roots_reply.
+  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
+
+  ; Whether that module's own wallet is open and usable, and which account it
+  ; pays with (`payer`, hex64; since 6.0.0 also `payer_public_key`, hex64 — ""
+  ; when the wallet holds no key for the payer, which is what funds it):
+  ; pays with:
+  ; {"detail":s,"network":s,"payer":hex64,"ready":b,
+  ;  "state":"pending"|"ready"|"failed"}.
+  ; Never fails and never touches the chain. `network` (since v4.1.0) is the
+  ; network the wallet home is recorded as bound to, "" while unbound or
+  ; operator-configured; an unbound home stays "pending" until use_network.
+  ; Since v3.0.0 the provider links the LEZ wallet crate and brings a wallet
+  ; up itself, so every method above answers "" until this reports ready.
+  ; Branch on `state`: "pending" is worth retrying, "failed" is not.
+  method wallet_status() -> tstr
+
+  ; Live NATIVE balance of account_id as a decimal STRING; "" selects the
+  ; provider's own payer. {"account":hex64,"balance":decimal}; "" on error,
+  ; never zero. This is how a consumer asks "can this node afford to
+  ; register", and it replaced get_token_balance and the holding-account walk
+  ; when the registry became single-asset.
+  method get_native_balance(account_id: tstr) -> tstr
+
+  ; Since v4.1.0. Select the wallet's network by the CAIP-2 reference of a
+  ; `logos` registry id, or check it against the one already bound:
+  ; {"accepted":b,"detail":s,"network":s,"retry":b,
+  ;  "source":"table"|"env"|"operator"|""}.
+  ; retry:true means the wallet home is not resolved yet — ask again;
+  ; otherwise the answer is final. An operator-configured home accepts any
+  ; reference unchecked (source "operator"). See provider::ensure_network.
+  method use_network(reference: tstr) -> tstr
+
+  ; Since v4.2.0. The head fee market of the sequencer that module's wallet is
+  ; configured with — getFeeState's result passed through:
+  ; {"base_fee_exec":N,"base_fee_stor":N,"height":N,"max_gas_exec":N,
+  ;  "max_gas_stor":N,"next_base_fee_exec_ceiling":N,
+  ;  "next_base_fee_exec_floor":N,"next_base_fee_stor_ceiling":N,
+  ;  "next_base_fee_stor_floor":N}; "" before a network is selected, against an
+  ; https sequencer, and on any transport error. What a registration's fee
+  ; reserve is sized from (ensure::fee_reserve); an older provider without
+  ; the method, or "", falls back to the wallet's fixed max_fee.
+  method get_fee_state() -> tstr
+
+  ; Whether a registry is usable on the module's chain, and if not why:
+  ; {"status":"ok"|"not_deployed"|"wrong_generation"|"unexpected_layout"|
+  ; "network_conflict"|"unreachable"|"invalid","detail":s?,"sequencer":s?,
+  ; "chain_head":N?}. Since 5.1.0.
+  method check_registry(config_account_id: tstr) -> tstr
+}
