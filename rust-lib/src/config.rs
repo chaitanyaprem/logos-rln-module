@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::delegated::DelegatedOptions;
 use crate::error::{ApiError, ErrorKind};
+use crate::registry_id::CanonicalRegistryId;
 use crate::util::lock;
 
 pub(crate) const DEFAULT_RATE_LIMIT: u64 = 100;
@@ -71,11 +72,14 @@ pub(crate) fn epoch_binding_warning(
     )
 }
 
-pub(crate) fn allocator_for(registry_canonical: &str) -> Option<DelegatedOptions> {
-    lock(&CONFIG)
+pub(crate) fn allocator_for(registry: &CanonicalRegistryId) -> Option<DelegatedOptions> {
+    match lock(&CONFIG)
         .as_ref()
-        .and_then(|c| c.per_registry.get(registry_canonical))
-        .and_then(|c| c.allocator.clone())
+        .and_then(|c| c.per_registry.get(&registry.canonical))
+    {
+        Some(configured) => configured.allocator.clone(),
+        None => Some(DelegatedOptions::default_for(registry)),
+    }
 }
 
 #[cfg(test)]

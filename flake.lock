@@ -40765,11 +40765,11 @@
         "logos-module-builder": "logos-module-builder_8"
       },
       "locked": {
-        "lastModified": 1795142244,
-        "narHash": "sha256-P2IquRN3Pdna0Eb1cYgzBA9b5eqMbm5n16cb7he9Dbs=",
+        "lastModified": 1795578810,
+        "narHash": "sha256-T4OqNw2hIZZ1UrKAvqeWe/4+j2+OZSjD0EjtXMG3m20=",
         "owner": "logos-co",
         "repo": "logos-membership-allocation-client-module",
-        "rev": "d8286f4072197952d4f7b575fbc2b4894074ec22",
+        "rev": "ea9f179f1bfaab1b770600d4c6371b88fd02a029",
         "type": "github"
       },
       "original": {

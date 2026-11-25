@@ -1,4 +1,8 @@
+use crate::allocator_networks;
 use crate::error::{ApiError, ErrorKind};
+use crate::registry_id::CanonicalRegistryId;
+
+pub(crate) const DEFAULT_AUTH_TYPE: &str = "peer-any";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DelegatedOptions {
@@ -9,6 +13,8 @@ pub(crate) struct DelegatedOptions {
     pub(crate) auth_payload: Option<String>,
     pub(crate) auth_provider: Option<String>,
     pub(crate) auth_args: Option<String>,
+    pub(crate) bootstrap_peers: Vec<String>,
+    pub(crate) probe_first: bool,
 }
 
 const OPTION_PAIR_KEYS: (&str, &str) = ("allocator_peer_id", "allocator_multiaddr");
@@ -57,6 +63,27 @@ fn validate_delegated(
 }
 
 impl DelegatedOptions {
+    pub(crate) fn default_for(registry: &CanonicalRegistryId) -> Self {
+        Self {
+            discover: true,
+            allocator_peer_id: String::new(),
+            allocator_multiaddr: String::new(),
+            auth_type: Some(DEFAULT_AUTH_TYPE.to_string()),
+            auth_payload: None,
+            auth_provider: None,
+            auth_args: None,
+            bootstrap_peers: allocator_networks::bootstrap_peers(registry),
+            probe_first: true,
+        }
+    }
+
+    pub(crate) fn on_network(mut self, registry: &CanonicalRegistryId) -> Self {
+        if self.bootstrap_peers.is_empty() {
+            self.bootstrap_peers = allocator_networks::bootstrap_peers(registry);
+        }
+        self
+    }
+
     pub(crate) fn from_allocator_block(
         v: Option<&serde_json::Value>,
         what: &str,
@@ -67,7 +94,7 @@ impl DelegatedOptions {
             Some(_) => {
                 return Err(ApiError::new(
                     ErrorKind::InvalidArgument,
-                    format!("{what} must be an object {{discover?, peer_id?, multiaddr?, auth_type?, auth_payload?|auth_provider?, auth_args?}}"),
+                    format!("{what} must be an object {{discover?, peer_id?, multiaddr?, auth_type?, auth_payload?|auth_provider?, auth_args?, bootstrap_peers?}}"),
                 ))
             }
         };
@@ -92,6 +119,25 @@ impl DelegatedOptions {
                 )),
             }
         };
+        let bootstrap_peers = match obj.get("bootstrap_peers") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(peers)) => peers
+                .iter()
+                .map(|peer| match peer.as_str().map(str::trim) {
+                    Some(p) if !p.is_empty() => Ok(p.to_string()),
+                    _ => Err(ApiError::new(
+                        ErrorKind::InvalidArgument,
+                        format!("{what}.bootstrap_peers must be multiaddr strings, got {peer}"),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+            Some(other) => {
+                return Err(ApiError::new(
+                    ErrorKind::InvalidArgument,
+                    format!("{what}.bootstrap_peers must be an array, got {other}"),
+                ))
+            }
+        };
         let d = Self {
             discover,
             allocator_peer_id: text("peer_id")?.unwrap_or_default(),
@@ -100,6 +146,8 @@ impl DelegatedOptions {
             auth_payload: text("auth_payload")?,
             auth_provider: text("auth_provider")?,
             auth_args: text("auth_args")?,
+            bootstrap_peers,
+            probe_first: false,
         };
         validate_delegated(&d, BLOCK_PAIR_KEYS)
             .map_err(|e| ApiError::new(e.kind, format!("{what}: {}", e.message)))?;
@@ -132,6 +180,8 @@ impl DelegatedOptions {
             auth_payload: flat_str_option(&mut opts, "auth_payload"),
             auth_provider: flat_str_option(&mut opts, "auth_provider"),
             auth_args: flat_str_option(&mut opts, "auth_args"),
+            bootstrap_peers: Vec::new(),
+            probe_first: false,
         };
         validate_delegated(&d, OPTION_PAIR_KEYS)?;
         Ok(Some(d))
@@ -177,6 +227,9 @@ pub(crate) fn delegated_request_args(
     if let Some(extra) = &d.auth_args {
         args["authArgs"] = extra.as_str().into();
     }
+    if !d.bootstrap_peers.is_empty() {
+        args["bootstrapPeers"] = d.bootstrap_peers.as_slice().into();
+    }
     args.to_string()
 }
 
@@ -194,10 +247,18 @@ mod tests {
             auth_payload: None,
             auth_provider: None,
             auth_args: None,
+            bootstrap_peers: Vec::new(),
+            probe_first: false,
         };
         let v: serde_json::Value =
             serde_json::from_str(&delegated_request_args(&d, "ab", 300, "cf")).unwrap();
-        for key in ["authType", "authPayload", "authProvider", "authArgs"] {
+        for key in [
+            "authType",
+            "authPayload",
+            "authProvider",
+            "authArgs",
+            "bootstrapPeers",
+        ] {
             assert!(
                 v.get(key).is_none(),
                 "unset {key} must stay absent, got: {v}"
@@ -261,6 +322,56 @@ mod tests {
             "allocatorMultiaddr",
         ] {
             assert!(v.get(key).is_none(), "{key} must stay absent, got: {v}");
+        }
+    }
+
+    #[test]
+    fn the_default_asks_any_peer_allocator_found_through_the_networks_peers() {
+        let on = |raw: &str| crate::registry_id::parse(raw).unwrap();
+        let testnet = on(&format!("logos:testnet:{}", "ab".repeat(32)));
+        let local = on(&format!("logos:local:{}", "ab".repeat(32)));
+
+        let d = DelegatedOptions::default_for(&testnet);
+        assert!(d.discover && d.probe_first && d.allocator_peer_id.is_empty());
+        assert_eq!(d.auth_type.as_deref(), Some("peer-any"));
+        assert_eq!(d.bootstrap_peers.len(), 6);
+        assert!(DelegatedOptions::default_for(&local)
+            .bootstrap_peers
+            .is_empty());
+        let v: serde_json::Value =
+            serde_json::from_str(&delegated_request_args(&d, "ab", 100, "cf")).unwrap();
+        assert_eq!(v["authType"], "peer-any", "got: {v}");
+        assert_eq!(v["discover"], true, "got: {v}");
+        assert_eq!(v["bootstrapPeers"].as_array().unwrap().len(), 6, "got: {v}");
+
+        let block = |v: serde_json::Value| DelegatedOptions::from_allocator_block(Some(&v), "x");
+        let own = block(serde_json::json!({ "bootstrap_peers": ["/ip4/10.0.0.2/tcp/1/p2p/P"] }))
+            .unwrap()
+            .unwrap();
+        assert!(!own.probe_first && own.auth_type.is_none());
+        assert_eq!(
+            own.clone().on_network(&testnet).bootstrap_peers,
+            ["/ip4/10.0.0.2/tcp/1/p2p/P"]
+        );
+        let plain = block(serde_json::json!({})).unwrap().unwrap();
+        assert_eq!(plain.clone().on_network(&testnet).bootstrap_peers.len(), 6);
+        assert!(plain.on_network(&local).bootstrap_peers.is_empty());
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "bootstrap_peers": "/ip4/1/tcp/1/p2p/P" }),
+                "must be an array",
+            ),
+            (
+                serde_json::json!({ "bootstrap_peers": ["/ip4/1/tcp/1/p2p/P", 7] }),
+                "must be multiaddr strings",
+            ),
+            (
+                serde_json::json!({ "bootstrap_peers": [" "] }),
+                "must be multiaddr strings",
+            ),
+        ] {
+            let e = block(bad.clone()).unwrap_err();
+            assert!(e.message.contains(needle), "{bad}: {}", e.message);
         }
     }
 

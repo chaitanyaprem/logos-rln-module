@@ -77,7 +77,7 @@ switch on `class`, log `kind`.
 
 | Spec function | Method (args) | Dialect | Success reply (the `value` for result methods) |
 |---|---|---|---|
-| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{"epoch_size_sec","max_epoch_gap"}}`, the per-registry table in force, once any call named a registry. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "rate_limit"?:N, "provision"?:bool, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?,"rate_limit"?}]}` — spec: epoch size and max gap are per-REGISTRY configuration; a call sets the registries it names and leaves the others in force (see start() config) |
+| `start(config)` | `start(config_json)` | result | `{"started":true,"epoch_size_sec":N,"max_epoch_gap":N,"registries":[…]}` + `"overrides":{registry:{"epoch_size_sec","max_epoch_gap"}}`, the per-registry table in force, once any call named a registry. config: `{"epoch_size_sec":N (required default), "max_epoch_gap"?:N, "rate_limit"?:N, "provision"?:bool, "allocator"?:{…}\|null, "registries"?:[caip10 \| {"registry_id","epoch_size_sec"?,"max_epoch_gap"?,"rate_limit"?,"allocator"?:{…}\|null}]}` — spec: epoch size and max gap are per-REGISTRY configuration; a call sets the registries it names and leaves the others in force (see start() config) |
 | `stop()` | `stop()` | result | `{"stopped":true}` |
 | `register(scope, options)` | `register_membership(registry_id, rln_identifier_hex, options_json)` | tstr | public Membership view (below), `"state":"pending"` on a fresh submit; `options_json` is the RegistryOptions ARRAY (below), the common `rate_limit` key defaulted when absent |
 | `get_membership_state(scope)` | `get_membership_state(registry_id, rln_identifier_hex)` | tstr | `{"state":…}` + `membership_hash`/`leaf_index`/`rate_limit` when known; `"unknown"` + `"provisioning":{…}` (below) while provisioning works on the registry |
@@ -103,8 +103,9 @@ The **provisioning object** on an `"unknown"` state (`start()` and
 `{"step":"delegating"|"waiting_for_wallet"|"awaiting_funding"|"registering"|"done"|"refused",
 "detail":str, "fallback_reason"?:str}` — `detail` is a human sentence,
 omitted when empty; `delegating` is the registry's allocator (`start()`'s
-`allocator` block) being asked first, and `fallback_reason` says why it did
-not deliver on every step of the funded fallback that follows. On
+`allocator` block, or the default) being looked for and asked first, and
+`fallback_reason` says why it did not deliver on every step of the funded
+fallback that follows. On
 `awaiting_funding` only, the numbers behind the sentence travel as fields,
 decimal strings like every balance on this wire: `"payer"` (hex64 account to
 fund), `"required"` (price + fee reserve), `"price"`, `"fee_reserve"`, and
@@ -402,19 +403,50 @@ after a host's `{"epoch_size_sec":600,"registries":["D",{"registry_id":"M","epoc
 leaves M at 10 s. To move a configured registry, name it with an object.
 Provisioning (on unless `"provision":false`) covers every registry in force,
 each at its own rate; a registry that already holds a membership stands the
-pass down at once. With an `allocator` block — top level for every registry
-the call names, or on an entry (`null` opts that registry out):
-`{"discover"?,"peer_id"?,"multiaddr"?,"auth_type"?,"auth_payload"?|"auth_provider"?,"auth_args"?}`,
-the delegated vocabulary of `register_membership` — the pass asks the
-allocators advertising the (registry, auth type) pair through libp2p
-service discovery first (`discover`, default true; `{}` is discovery alone,
-and it needs this node's `libp2p_module` up with discovery mounted and
-bootstrap peers, which the host arranges), then the configured
-`peer_id`+`multiaddr` pair (the RLN Membership Allocation Protocol through
-`membership_allocation_client_module` over this node's `libp2p_module`; the request names
-the registry, so one allocator covers both) and falls back to the funded
-registration when nothing was granted, recording why as
-`provisioning.fallback_reason`.
+pass down at once.
+
+The pass asks a membership allocator before it pays (the RLN Membership
+Allocation Protocol through `membership_allocation_client_module`, over that
+module's own libp2p node) and falls back to the funded registration when
+nothing was granted, recording why as `provisioning.fallback_reason`. Which
+allocator is the registry's `allocator` setting, top level for every
+registry the call names or on an entry:
+
+- **No key: the default.** Discovery with `auth_type` `peer-any`: the
+  allocators advertising the (registry, `peer-any`) pair through libp2p
+  service discovery. A host only names its registries. The default looks
+  first (one `discover`) and sends a request only when an allocator is
+  listed, so a miss mints no record and no credential. An allocator has to
+  verify `peer-any` to be found; an open one is not.
+- **A block:**
+  `{"discover"?,"peer_id"?,"multiaddr"?,"auth_type"?,"auth_payload"?|"auth_provider"?,"auth_args"?,"bootstrap_peers"?}`,
+  the delegated vocabulary of `register_membership`: discovered allocators
+  first (`discover`, default true; `{}` is discovery alone, for an open
+  allocator), then the configured `peer_id`+`multiaddr` pair. The request
+  names the registry, so one allocator covers several.
+- **`null`:** the funded registration alone.
+
+The host arranges nothing for discovery. Each `logos` network (the registry
+id's reference) has built-in bootstrap peers in
+`rust-lib/allocator-networks.json`, and a block's own `bootstrap_peers`
+replace them. They travel with every `discover` and `request`: the
+allocation client (`membership_allocation_client_module` ≥ 0.3.0) brings a
+libp2p node of its own up on them and stops it after 30 s without use. It
+does not use `libp2p_module` and does not read `LIBP2P_MODULE_CONFIG`, so a
+host's own libp2p node and the order of start do not matter. A network with
+no listed peer answers "discovery unavailable", and the funded registration
+starts at once.
+
+A deployment on a network the built-in table does not list (a local chain,
+a test fleet) names its peers in the environment variable
+`RLN_ALLOCATOR_NETWORKS`: a table in the format of
+`allocator-networks.json`, inline JSON or a file path. Its entries replace
+the built-in ones by `reference`, and an entry with no peer turns discovery
+off for that network. The variable is read each time a registry's allocator
+is resolved: at every `start()` that names the registry, and at
+`ensure_membership` or `register_membership` for a registry no start named.
+A table written after the module loaded counts from the next such call, and
+a registry keeps the peers its last `start()` resolved.
 
 A discovery miss — the allocation client's failure of kind `no_provider`
 with `discovery` `none_advertising` or `not_joined` — does not end the
