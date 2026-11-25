@@ -271,7 +271,7 @@ pub(crate) fn allocation_request_async(
     })
 }
 
-pub(crate) const ALLOCATOR_DISCOVER_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const ALLOCATOR_DISCOVER_TIMEOUT: Duration = Duration::from_secs(130);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DiscoverReply {
@@ -319,10 +319,14 @@ impl DiscoverReply {
 pub(crate) fn allocator_discover_async(
     registry: &CanonicalRegistryId,
     auth_type: Option<&str>,
+    bootstrap_peers: &[String],
 ) -> Result<DiscoverReply, ApiError> {
     let mut args = serde_json::json!({ "config": registry.account });
     if let Some(t) = auth_type {
         args["authType"] = t.into();
+    }
+    if !bootstrap_peers.is_empty() {
+        args["bootstrapPeers"] = bootstrap_peers.into();
     }
     #[cfg(test)]
     if let Some(allocator) = lock(&crate::test_support::INSTALLED_ALLOCATOR).as_ref() {

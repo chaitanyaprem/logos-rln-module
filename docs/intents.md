@@ -29,10 +29,13 @@ Everything else stays what it is:
   (`messageQueued`) and sends when the epoch budget refills; nothing there
   is a decision for a human.
 
-What *is* user-mediated is acquiring a membership: it spends the user's
-balance, or asks them to fund an account, or asks an allocator to pay on their
-behalf. That is the one capability below that does work; the other is
-navigation to the place where that work can be watched.
+What *is* user-mediated is acquiring a membership the user pays for, or one
+from an allocator an app names: it spends the user's balance, or asks them to
+fund an account, or commits them to that allocator. That is the one capability
+below that does work; the other is navigation to the place where that work can
+be watched. Provisioning itself first asks the registry network's own
+allocators with the `peer-any` vector (`start()` without an `allocator` key),
+which costs the user nothing and is not an intent.
 
 ## Vocabulary
 

@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
+mod allocator_networks;
 mod config;
 mod delegated;
 mod ensure;
@@ -111,29 +112,51 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
         .and_then(serde_json::Value::as_u64)
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_RATE_LIMIT);
-    let default_allocator =
-        DelegatedOptions::from_allocator_block(cfg.get("allocator"), "config_json.allocator")?;
+    let allocation_in = |v: Option<&serde_json::Value>, what: &str| match v {
+        None => Ok(None),
+        Some(v) => DelegatedOptions::from_allocator_block(Some(v), what).map(Some),
+    };
+    let allocator_on = |stated: &Option<Option<DelegatedOptions>>,
+                        registry: &registry_id::CanonicalRegistryId| {
+        match stated {
+            None => Some(DelegatedOptions::default_for(registry)),
+            Some(None) => None,
+            Some(Some(block)) => Some(block.clone().on_network(registry)),
+        }
+    };
+    let default_allocation = allocation_in(cfg.get("allocator"), "config_json.allocator")?;
+
+    struct Entry {
+        epoch_size_sec: u64,
+        max_epoch_gap: u64,
+        rate_limit: u64,
+        allocation: Option<Option<DelegatedOptions>>,
+    }
 
     let (mut registries, mut per_registry) = config::registries_snapshot();
-    let mut track = |raw: &str, set: Option<RegistryConfig>| {
+    let mut track = |raw: &str, entry: Option<Entry>| {
         if let Ok(registry) = registry_id::parse(raw) {
             roots::track(&registry);
-            match set {
-                Some(c) => {
-                    per_registry.insert(registry.canonical.clone(), c);
-                }
-                None if per_registry.contains_key(&registry.canonical) => {}
-                None => {
-                    per_registry.insert(
-                        registry.canonical.clone(),
-                        RegistryConfig {
-                            epoch_size_sec,
-                            max_epoch_gap,
-                            rate_limit: default_rate,
-                            allocator: default_allocator.clone(),
-                        },
-                    );
-                }
+            let entry = match entry {
+                Some(entry) => Some(entry),
+                None if per_registry.contains_key(&registry.canonical) => None,
+                None => Some(Entry {
+                    epoch_size_sec,
+                    max_epoch_gap,
+                    rate_limit: default_rate,
+                    allocation: default_allocation.clone(),
+                }),
+            };
+            if let Some(entry) = entry {
+                per_registry.insert(
+                    registry.canonical.clone(),
+                    RegistryConfig {
+                        epoch_size_sec: entry.epoch_size_sec,
+                        max_epoch_gap: entry.max_epoch_gap,
+                        rate_limit: entry.rate_limit,
+                        allocator: allocator_on(&entry.allocation, &registry),
+                    },
+                );
             }
             if !registries.contains(&registry.canonical) {
                 registries.push(registry.canonical);
@@ -151,20 +174,19 @@ fn start_impl(config_json: &str) -> Result<serde_json::Value, ApiError> {
                         .unwrap_or_default();
                     let positive =
                         |key: &str| o.get(key).and_then(|x| x.as_u64()).filter(|n| *n > 0);
-                    let allocator = match o.get("allocator") {
-                        None => default_allocator.clone(),
-                        Some(v) => DelegatedOptions::from_allocator_block(
-                            Some(v),
-                            &format!("registries[{raw}].allocator"),
-                        )?,
+                    let allocation = match o.get("allocator") {
+                        None => default_allocation.clone(),
+                        stated => allocation_in(stated, &format!("registries[{raw}].allocator"))?,
                     };
-                    let set = RegistryConfig {
-                        epoch_size_sec: positive("epoch_size_sec").unwrap_or(epoch_size_sec),
-                        max_epoch_gap: positive("max_epoch_gap").unwrap_or(max_epoch_gap),
-                        rate_limit: positive("rate_limit").unwrap_or(default_rate),
-                        allocator,
-                    };
-                    track(raw, Some(set));
+                    track(
+                        raw,
+                        Some(Entry {
+                            epoch_size_sec: positive("epoch_size_sec").unwrap_or(epoch_size_sec),
+                            max_epoch_gap: positive("max_epoch_gap").unwrap_or(max_epoch_gap),
+                            rate_limit: positive("rate_limit").unwrap_or(default_rate),
+                            allocation,
+                        }),
+                    );
                 }
                 _ => {}
             }
@@ -697,7 +719,7 @@ mod tests {
         });
         let out = start_impl(&cfg.to_string()).unwrap();
         assert_eq!(out["started"], serde_json::json!(true), "got: {out}");
-        let canonical = |r: &str| registry_id::parse(r).unwrap().canonical;
+        let canonical = |r: &str| registry_id::parse(r).unwrap();
         let a_alloc = allocator_for(&canonical(&a)).expect("a takes the global allocator");
         assert_eq!(a_alloc.allocator_peer_id, "16Uiu2Peer");
         assert_eq!(a_alloc.auth_type.as_deref(), Some("peer-any"));
@@ -770,5 +792,61 @@ mod tests {
             );
         }
         stop_impl().unwrap();
+    }
+
+    #[test]
+    fn start_gives_a_registry_the_default_allocator_unless_told_otherwise() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        crate::config::reset_config_for_test();
+        let id = |network: &str, byte: &str| format!("logos:{network}:{}", byte.repeat(32));
+        let (plain, entry, off, own, unnamed) = (
+            id("testnet", "a8"),
+            id("local", "b8"),
+            id("testnet", "c8"),
+            id("testnet", "d8"),
+            id("testnet", "e8"),
+        );
+        let on = |r: &str| allocator_for(&registry_id::parse(r).unwrap());
+        let cfg = serde_json::json!({
+            "epoch_size_sec": 600, "provision": false,
+            "registries": [
+                plain,
+                { "registry_id": entry, "rate_limit": 20 },
+                { "registry_id": off, "allocator": null },
+                { "registry_id": own, "allocator": { "auth_type": "peer-allowlist" } },
+            ],
+        });
+        start_impl(&cfg.to_string()).unwrap();
+
+        let default = on(&plain).expect("a named registry delegates by default");
+        assert!(default.discover && default.probe_first);
+        assert_eq!(default.auth_type.as_deref(), Some("peer-any"));
+        assert_eq!(default.bootstrap_peers.len(), 6);
+        let local = on(&entry).expect("an entry without the key delegates too");
+        assert!(local.probe_first && local.bootstrap_peers.is_empty());
+        assert!(on(&off).is_none(), "null opts the registry out");
+        let stated = on(&own).expect("a block is taken as written");
+        assert!(!stated.probe_first);
+        assert_eq!(stated.auth_type.as_deref(), Some("peer-allowlist"));
+        assert_eq!(stated.bootstrap_peers.len(), 6);
+        assert_eq!(
+            on(&unnamed),
+            Some(DelegatedOptions::default_for(
+                &registry_id::parse(&unnamed).unwrap()
+            ))
+        );
+        stop_impl().unwrap();
+
+        crate::config::reset_config_for_test();
+        let cfg = serde_json::json!({
+            "epoch_size_sec": 600, "provision": false, "allocator": null,
+            "registries": [plain, { "registry_id": own, "allocator": {} }],
+        });
+        start_impl(&cfg.to_string()).unwrap();
+        assert!(on(&plain).is_none(), "a top-level null is funded only");
+        assert!(on(&own).is_some_and(|a| !a.probe_first && a.auth_type.is_none()));
+        stop_impl().unwrap();
+        crate::config::reset_config_for_test();
+        worker::reset_for_test();
     }
 }

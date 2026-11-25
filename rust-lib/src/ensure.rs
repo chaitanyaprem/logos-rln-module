@@ -242,7 +242,9 @@ pub(crate) fn run_with(registries: Vec<Provision>, ticket: u64) {
 }
 
 pub(crate) fn run_alongside(registry: String, rate_limit: u64, ticket: u64) {
-    let allocator = crate::config::allocator_for(&registry);
+    let allocator = registry_id::parse(&registry)
+        .ok()
+        .and_then(|parsed| crate::config::allocator_for(&parsed));
     run_as(
         vec![Provision {
             registry,
@@ -396,7 +398,11 @@ fn ask_again(
     let Some(a) = *retry else { return false };
     let who = allocator_who(registry, a);
     let next = discovery_retry_every().as_secs();
-    let probe = crate::provider::allocator_discover_async(registry, a.auth_type.as_deref());
+    let probe = crate::provider::allocator_discover_async(
+        registry,
+        a.auth_type.as_deref(),
+        &a.bootstrap_peers,
+    );
     let miss = match probe {
         Err(ApiError { message: e, .. }) | Ok(DiscoverReply::Failed(e)) => {
             eprintln!(
@@ -471,6 +477,34 @@ fn ask_again(
     }
 }
 
+enum FirstLook {
+    Listed,
+    Miss(String),
+    Gone(String),
+}
+
+fn first_look(registry: &registry_id::CanonicalRegistryId, a: &DelegatedOptions) -> FirstLook {
+    match crate::provider::allocator_discover_async(
+        registry,
+        a.auth_type.as_deref(),
+        &a.bootstrap_peers,
+    ) {
+        Ok(DiscoverReply::Listed {
+            joined: false,
+            peers,
+            ..
+        }) => FirstLook::Miss(format!("discovery not joined ({peers} peers)")),
+        Ok(DiscoverReply::Listed {
+            candidates: 0,
+            peers,
+            ..
+        }) => FirstLook::Miss(format!("discovery: no allocator yet ({peers} peers)")),
+        Ok(DiscoverReply::Listed { .. }) => FirstLook::Listed,
+        Ok(DiscoverReply::Unavailable(e) | DiscoverReply::Failed(e))
+        | Err(ApiError { message: e, .. }) => FirstLook::Gone(e),
+    }
+}
+
 fn provision_one(
     registry: &registry_id::CanonicalRegistryId,
     rate_limit: u64,
@@ -520,7 +554,32 @@ fn provision_one(
     }
 
     let mut retry: Option<&DelegatedOptions> = None;
-    if let Some(a) = allocator {
+    let listed = allocator.filter(|a| {
+        if !a.probe_first {
+            return true;
+        }
+        let who = allocator_who(registry, a);
+        record(
+            &registry.canonical,
+            Step::Delegating,
+            format!("looking for {who}"),
+        );
+        let why = match first_look(registry, a) {
+            FirstLook::Listed => return true,
+            FirstLook::Miss(why) => {
+                retry = Some(a);
+                why
+            }
+            FirstLook::Gone(why) => why,
+        };
+        eprintln!(
+            "provision {}: {who}: {why}; falling back to a funded registration",
+            registry.canonical
+        );
+        set_fallback(&registry.canonical, format!("{who}: {why}"));
+        false
+    });
+    if let Some(a) = listed {
         match delegate_one(registry, rate_limit, a, mine) {
             Delegated::Granted | Delegated::Superseded => return Ok(()),
             Delegated::Locked(why) => {
@@ -1301,6 +1360,7 @@ mod tests {
         fn new(name: &str, balance: u128, answers: Box<Answers>) -> Self {
             use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
             use std::sync::{atomic::AtomicUsize, Arc};
+            crate::worker::reset_for_test();
             let dir =
                 std::env::temp_dir().join(format!("rln-discovery-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
@@ -1509,6 +1569,115 @@ mod tests {
             pass.counts(),
             (1, 1, 1, 2),
             "one probe, then the funded submit"
+        );
+    }
+
+    fn run_default(pass: &DiscoveryPass) {
+        let registry = registry_id::parse(&pass.registry).unwrap();
+        ensure::run_with(
+            vec![ensure::Provision {
+                registry: pass.registry.clone(),
+                rate_limit: 100,
+                allocator: Some(DelegatedOptions::default_for(&registry)),
+            }],
+            ensure::supersede(),
+        );
+    }
+
+    #[test]
+    fn the_default_looks_for_an_allocator_before_it_asks_one() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let saw = std::sync::Arc::clone(&seen);
+        let pass = DiscoveryPass::new(
+            "default-listed",
+            1_000_000_000_000,
+            Box::new(move |method, _, args, _| {
+                crate::lock(&saw).push((method.to_string(), args["authType"].clone()));
+                match method {
+                    "request" => granted(args),
+                    _ => listed(1),
+                }
+            }),
+        );
+        run_default(&pass);
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(step.step, ensure::Step::Done, "{}", step.detail);
+        assert!(step.detail.contains("(discovered)"), "{}", step.detail);
+        assert!(step.fallback_reason.is_none());
+        assert_eq!(pass.counts(), (1, 1, 0, 1));
+        assert_eq!(
+            *crate::lock(&seen),
+            [
+                ("discover".to_string(), serde_json::json!("peer-any")),
+                ("request".to_string(), serde_json::json!("peer-any")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_default_that_finds_no_allocator_mints_nothing_and_looks_once_more() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        DISCOVERY_RETRY_SECS.store(1, Ordering::SeqCst);
+        let pass = DiscoveryPass::new(
+            "default-miss",
+            1_000_000_000_000,
+            Box::new(|method, _, args, _| match method {
+                "request" => granted(args),
+                _ => listed(0),
+            }),
+        );
+        run_default(&pass);
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(
+            pass.counts(),
+            (0, 2, 1, 1),
+            "no request, a second look, then the funded submit and its one record"
+        );
+        assert!(
+            step.fallback_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("no allocator yet")),
+            "{:?}",
+            step.fallback_reason
+        );
+    }
+
+    #[test]
+    fn a_default_without_discovery_pays_without_waiting() {
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let pass = DiscoveryPass::new(
+            "default-gone",
+            1_000_000_000_000,
+            Box::new(|method, _, args, _| match method {
+                "request" => granted(args),
+                _ => Ok(serde_json::json!({
+                    "kind": "no_provider",
+                    "error": "discovery unavailable: discoRegisterInterest: No libp2p context",
+                })
+                .to_string()),
+            }),
+        );
+        let began = std::time::Instant::now();
+        run_default(&pass);
+        let step = ensure::progress(&pass.registry).expect("a step is recorded");
+        assert_eq!(
+            pass.counts(),
+            (0, 1, 1, 1),
+            "one look, then the funded submit"
+        );
+        assert!(
+            began.elapsed() < discovery_retry_every() / 2,
+            "nothing holds the funded registration back: {:?}",
+            began.elapsed()
+        );
+        assert!(
+            step.fallback_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("discovery unavailable")),
+            "{:?}",
+            step.fallback_reason
         );
     }
 

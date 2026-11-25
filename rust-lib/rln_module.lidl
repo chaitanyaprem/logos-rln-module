@@ -41,7 +41,7 @@
 ; Events are a third channel, pushed over the lp event stream rather than
 ; returned from a call — see the events section below.
 module rln_module {
-  version "0.16.2"
+  version "0.18.0"
   description "RLN Membership Management Module"
   category "blockchain"
   depends [rln_lez_module, membership_allocation_client_module]
@@ -159,9 +159,10 @@ module rln_module {
   ; membership_allocation_client_module.request with the module-generated
   ; commitment and the scope's registry (its config account). Since 0.16.0
   ; the allocation client asks the allocators advertising the (registry,
-  ; auth_type) pair through libp2p service discovery first ("discover"; this
-  ; node's libp2p_module must have discovery mounted, else that step reports
-  ; itself unavailable) and the configured pair after them;
+  ; auth_type) pair through libp2p service discovery first ("discover";
+  ; since 0.17.0 the request carries the bootstrap peers of the registry's
+  ; network, and since 0.18.0 the allocation client reaches them through a
+  ; libp2p node of its own, see start()) and the configured pair after them;
   ; "discover":"false" dials the pair alone, and neither is
   ; invalid_argument. An allocator that does not serve that registry refuses
   ; at once (reason scope_not_served) and a grant on another registry fails
@@ -229,7 +230,8 @@ module rln_module {
   ; reserve), "price", "fee_reserve", and "balance" once the first balance
   ; read happened. A UI renders "send <required> to <payer>" — or hands the
   ; pair to a wallet app — from the fields, never from the sentence. The
-  ; registry's allocator (start()'s "allocator") is asked first here too.
+  ; registry's allocator (start()'s "allocator", or since 0.17.0 the default
+  ; for a registry no start() named) is asked first here too.
   method ensure_membership(registry_id: tstr, options_json: tstr) -> tstr
 
   ; Spec get_membership_state(scope). Resolves the record answering the
@@ -490,7 +492,7 @@ module rln_module {
   ; rate-limiting methods — generate_proof, validate_proof, get_epoch_quota —
   ; fail not_ready), "max_epoch_gap"?:N (default 1),
   ; "rate_limit"?:N (default 100, the rate provisioning registers at),
-  ; "provision"?:bool (default true), "allocator"?:{…} (below),
+  ; "provision"?:bool (default true), "allocator"?:{…}|null (below),
   ; "registries"?:[…] (root windows are warmed immediately). A registries
   ; entry is either a "<caip10>" string or an object
   ; {"registry_id":"<caip10>","epoch_size_sec"?:N,"max_epoch_gap"?:N,
@@ -498,21 +500,19 @@ module rln_module {
   ; per-registry configuration; the rate-limiting methods resolve them per
   ; registry).
   ; Since 0.14.4 "allocator" names the membership allocator (RLN Membership
-  ; Allocation Protocol, membership_allocation_client_module + libp2p_module on this node)
+  ; Allocation Protocol, membership_allocation_client_module on this node)
   ; provisioning asks FIRST: {"discover"?:bool (default true),
   ; "peer_id"?:"<PeerId>","multiaddr"?:"<ma>" (together),
   ; "auth_type"?:"<scheme>-<authoriser>","auth_payload"?:hex |
-  ; "auth_provider"?:"<module>","auth_args"?:str} — the same vocabulary as
+  ; "auth_provider"?:"<module>","auth_args"?:str,
+  ; "bootstrap_peers"?:["/…/p2p/<PeerId>",…]} — the same vocabulary as
   ; register_membership's delegated options, validated the same way (a bad
   ; block fails start() invalid_argument; {} is discovery alone). Since
   ; 0.16.0 the allocators advertising the (registry, auth_type) pair
   ; through libp2p service discovery are asked first, in turn while none
-  ; has read the request, then the configured pair; discovery needs this
-  ; node's libp2p_module started with discovery mounted and bootstrap
-  ; peers, which the host arranges (a node without it goes straight to the
-  ; pair, or to the funded fallback). The top-level block applies to
-  ; every registry this call names; an entry's own block replaces it for
-  ; that registry, and an entry's null opts the registry out. The request
+  ; has read the request, then the configured pair. The top-level block
+  ; applies to every registry this call names; an entry's own block replaces
+  ; it for that registry, and null, at either level, opts out. The request
   ; names the registry, so one allocator serving several registries covers
   ; them all. Provisioning then runs "delegating" (asking the allocator;
   ; the record settles active via the registry read-back or failed via the
@@ -526,9 +526,38 @@ module rln_module {
   ; through) is probed again with the allocation client's discover every
   ; 60 s while the node waits for funds, and once, 60 s after the pass began,
   ; before paying; the allocator is asked only when a probe lists one.
-  ; Without an
-  ; allocator block, provisioning is the funded registration alone, as
-  ; before. Since 0.14.2 a call sets the registries it names and leaves
+  ; Since 0.17.0 a registry with NO "allocator" key, here or in its entry,
+  ; gets the default: discovery with auth_type "peer-any" (any libp2p peer,
+  ; once per peer and registry; an allocator must verify that vector to be
+  ; found, an open one is not). So a host only names its registries. The
+  ; default looks before it asks: one discover, and a request only when it
+  ; lists an allocator, so a node no allocator serves mints no record and no
+  ; credential for the attempt; a miss keeps the 60 s second look above, and
+  ; a node that cannot discover at all goes straight to the funded
+  ; registration with the reason in "fallback_reason". "allocator":null is
+  ; the funded registration alone.
+  ; Since 0.17.0 the host arranges nothing for discovery. Each `logos`
+  ; network (the registry id's reference) has built-in bootstrap peers
+  ; (rust-lib/allocator-networks.json), sent with every discover and
+  ; request, and a block's own "bootstrap_peers" replace them. A network
+  ; with no listed peer is "discovery unavailable": the funded registration
+  ; starts at once.
+  ; Since 0.18.0 the allocation client (membership_allocation_client_module
+  ; >= 0.3.0) reaches those peers through a libp2p node of its own, linked
+  ; into that module: loopback listen only, service discovery as a client,
+  ; one stored key, stopped after 30 s idle. libp2p_module is not used and
+  ; LIBP2P_MODULE_CONFIG is not read, so a host's own libp2p node and the
+  ; order of start do not matter. A deployment on a network the built-in
+  ; table does not list (a local chain, a test fleet) names its peers in the
+  ; environment variable RLN_ALLOCATOR_NETWORKS: a table in the format of
+  ; rust-lib/allocator-networks.json, inline JSON or a file path, whose
+  ; entries replace the built-in ones by "reference"; an entry with no peer
+  ; turns discovery off for that network. It is read each time a registry's
+  ; allocator is resolved: at every start() that names the registry, and at
+  ; ensure_membership or register_membership for a registry no start named.
+  ; A table written after the module loaded counts from the next such call;
+  ; a registry keeps the peers its last start() resolved.
+  ; Since 0.14.2 a call sets the registries it names and leaves
   ; every other registry's configuration in force: an object entry sets its
   ; registry's values (absent fields take this call's defaults); a plain
   ; string pins this call's defaults for a registry nothing has configured

@@ -18,6 +18,11 @@ derivation, clock reads, tx submission, Merkle proofs, valid roots), and
 delegated registration drives `membership_allocation_client_module` with the module's own
 commitment. No rln-layouts / risc0 dependencies.
 
+A host names registries and nothing else: provisioning asks the registry network's membership
+allocators first (discovery, auth vector `peer-any`) and pays for the registration itself when none
+grants. `rust-lib/allocator-networks.json` lists each network's bootstrap peers; `"allocator": null`
+in `start()` turns the asking off, a block replaces the default.
+
 ## Spec surface → wire methods
 
 The RLN-API C surface maps 1:1 onto module methods (single-string args,

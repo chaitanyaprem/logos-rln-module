@@ -310,7 +310,7 @@ pub(crate) fn register_impl(
 ) -> Result<serde_json::Value, ApiError> {
     let (registry, _, rln_id_hex) = parse_scope(registry_id_raw, rln_identifier_hex)?;
     let (rate_limit, opts) = parse_registry_options(options_json)?;
-    let delegated = DelegatedOptions::from_registry_options(opts)?;
+    let delegated = DelegatedOptions::from_registry_options(opts)?.map(|d| d.on_network(&registry));
     register_scoped(
         store,
         &registry,
