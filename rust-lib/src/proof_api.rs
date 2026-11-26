@@ -96,7 +96,7 @@ pub(crate) fn generate_proof_with(
 
     let mut credential = store.unseal_credential(hash)?;
 
-    let (path_elements_hex, path_indices) = match path_cache::hit(hash, leaf_index) {
+    let served = match path_cache::hit(hash, leaf_index) {
         Some(path) => path,
         None => {
             path_cache::fill_path_cache(&registry, hash, leaf_index, backend.tree)?;
@@ -114,8 +114,9 @@ pub(crate) fn generate_proof_with(
         identity_secret_hash_hex: std::mem::take(&mut credential.identity_secret_hash),
         rate_limit,
         message_id,
-        path_elements_hex,
-        path_indices,
+        path_elements_hex: served.path_elements_hex,
+        path_indices: served.path_indices,
+        path_version: served.version,
     };
     let rlp = proof::generate(&material, x, epoch, &rln_identifier).map_err(proof_error)?;
 
@@ -129,23 +130,24 @@ pub(crate) fn generate_proof_with(
     Ok(out)
 }
 
-/// Rebuild a membership's cached partial proof if its path or rate limit
-/// changed since the last build, so the next `generate_proof` only finishes
-/// it. Called by the poller right after it refreshes the path. Returns whether
-/// a partial was built; a locked keystore is not an error (nothing to warm).
-pub(crate) fn warm_partial(
+/// Rebuild a membership's cached partial proof for `path` when its fingerprint
+/// changed, so the next `generate_proof` only finishes it. The fingerprint is
+/// hashed once and passed through. A locked keystore is not an error (nothing
+/// to warm). Returns whether a new partial was stored.
+pub(crate) fn warm_prepared(
     store: &Store,
     hash: &str,
-    leaf_index: u64,
     rate_limit: u64,
+    path: &path_cache::PreparedPath,
 ) -> Result<bool, ApiError> {
     if rate_limit == 0 {
         return Ok(false);
     }
-    let Some((path_elements_hex, path_indices)) = path_cache::hit(hash, leaf_index) else {
-        return Ok(false);
-    };
-    if proof::partial_is_current(hash, rate_limit, &path_elements_hex, &path_indices) {
+    let fingerprint =
+        proof::partial_fingerprint(rate_limit, &path.path_elements_hex, &path.path_indices);
+    if proof::partial_matches(hash, &fingerprint) {
+        // Already current: only advance the slot's generation. No unseal.
+        proof::adopt_path_version(hash, &fingerprint, path.version);
         return Ok(false);
     }
     let mut credential = match store.unseal_credential(hash) {
@@ -158,10 +160,11 @@ pub(crate) fn warm_partial(
         identity_secret_hash_hex: std::mem::take(&mut credential.identity_secret_hash),
         rate_limit,
         message_id: 0,
-        path_elements_hex,
-        path_indices,
+        path_elements_hex: path.path_elements_hex.clone(),
+        path_indices: path.path_indices.clone(),
+        path_version: path.version,
     };
-    proof::warm_partial(&material).map_err(proof_error)
+    proof::warm_with_fingerprint(&material, fingerprint).map_err(proof_error)
 }
 
 pub(crate) fn epoch_of_timestamp(timestamp: &str, epoch_size_sec: u64) -> Result<u64, ApiError> {
