@@ -94,6 +94,7 @@ pub(crate) fn generate_proof_with(
     })?;
     let rate_limit = record.cache.rate_limit.unwrap_or(0);
 
+    let eviction_mark = proof::eviction_mark(hash);
     let mut credential = store.unseal_credential(hash)?;
 
     let served = match path_cache::hit(hash, leaf_index) {
@@ -117,6 +118,7 @@ pub(crate) fn generate_proof_with(
         path_elements_hex: served.path_elements_hex,
         path_indices: served.path_indices,
         path_version: served.version,
+        eviction_mark,
     };
     let rlp = proof::generate(&material, x, epoch, &rln_identifier).map_err(proof_error)?;
 
@@ -150,6 +152,7 @@ pub(crate) fn warm_prepared(
         proof::adopt_path_version(hash, &fingerprint, path.version);
         return Ok(false);
     }
+    let eviction_mark = proof::eviction_mark(hash);
     let mut credential = match store.unseal_credential(hash) {
         Ok(credential) => credential,
         Err(e) if e.kind == ErrorKind::Locked => return Ok(false),
@@ -163,6 +166,7 @@ pub(crate) fn warm_prepared(
         path_elements_hex: path.path_elements_hex.clone(),
         path_indices: path.path_indices.clone(),
         path_version: path.version,
+        eviction_mark,
     };
     proof::warm_with_fingerprint(&material, fingerprint).map_err(proof_error)
 }

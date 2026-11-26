@@ -39,6 +39,9 @@ pub(crate) struct WitnessMaterial {
     /// Not part of the circuit input. `store_partial` refuses to replace a
     /// slot built from a newer generation.
     pub(crate) path_version: u64,
+    /// `eviction_mark(membership_hash)`, taken before the credential was
+    /// unsealed. Not part of the circuit input.
+    pub(crate) eviction_mark: u64,
 }
 
 #[derive(Debug)]
@@ -221,6 +224,20 @@ struct CachedPartial {
 
 static PARTIALS: Mutex<Option<HashMap<String, CachedPartial>>> = Mutex::new(None);
 
+/// Per-slot eviction count. A build takes the slot's mark before it unseals
+/// the credential and `store_partial` refuses it if the slot was evicted since,
+/// so a proof or warm in flight across a lock cannot put the partial back.
+/// Lock order: `PARTIALS` before `EVICTIONS`.
+static EVICTIONS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// The slot's eviction mark. Take it before unsealing the credential.
+pub(crate) fn eviction_mark(slot: &str) -> u64 {
+    lock(&EVICTIONS)
+        .as_ref()
+        .and_then(|map| map.get(slot).copied())
+        .unwrap_or(0)
+}
+
 static PARTIAL_HITS: AtomicU64 = AtomicU64::new(0);
 static PARTIAL_MISSES: AtomicU64 = AtomicU64::new(0);
 static PARTIAL_REFRESHES: AtomicU64 = AtomicU64::new(0);
@@ -288,15 +305,24 @@ fn cached_partial(slot: &str, fingerprint: &[u8; 32]) -> Option<Arc<PartialProof
     (&entry.fingerprint == fingerprint).then(|| Arc::clone(&entry.partial))
 }
 
-/// Insert `partial` unless the slot already holds one built from a newer path
-/// generation. Returns whether the slot was replaced.
+/// Insert `partial` unless the slot was evicted after `eviction_mark` was
+/// taken, or already holds one built from a newer path generation. Returns
+/// whether the slot was replaced.
 fn store_partial(
     slot: &str,
     fingerprint: [u8; 32],
     partial: Arc<PartialProof>,
     path_version: u64,
+    eviction_mark: u64,
 ) -> bool {
     let mut guard = lock(&PARTIALS);
+    let evictions = lock(&EVICTIONS)
+        .as_ref()
+        .and_then(|map| map.get(slot).copied())
+        .unwrap_or(0);
+    if evictions != eviction_mark {
+        return false;
+    }
     let map = guard.get_or_insert_with(HashMap::new);
     if map
         .get(slot)
@@ -362,15 +388,19 @@ pub(crate) fn evict_partial(hash: &str) {
     evict_partials(std::iter::once(hash));
 }
 
-/// Drop these memberships' partials. The map removal is the zeroization
-/// boundary: `PartialProof` does not implement `Zeroize`.
+/// Drop these memberships' partials and bump their eviction marks, so a build
+/// that unsealed before the eviction cannot store afterwards. The map removal
+/// is the zeroization boundary: `PartialProof` does not implement `Zeroize`.
 pub(crate) fn evict_partials<'a>(hashes: impl IntoIterator<Item = &'a str>) {
     let mut guard = lock(&PARTIALS);
-    let Some(map) = guard.as_mut() else {
-        return;
-    };
+    let mut evictions = lock(&EVICTIONS);
+    let evictions = evictions.get_or_insert_with(HashMap::new);
     for hash in hashes {
-        map.remove(hash);
+        if let Some(map) = guard.as_mut() {
+            map.remove(hash);
+        }
+        let count = evictions.entry(hash.to_string()).or_insert(0);
+        *count = count.wrapping_add(1);
     }
 }
 
@@ -419,7 +449,13 @@ pub(crate) fn warm_with_fingerprint(
     let partial = RLN_STATELESS
         .generate_partial_proof(&RLNPartialWitnessInput::from(&witness))
         .map_err(|e| ProofError::Engine(format!("generate partial: {e}")))?;
-    let stored = store_partial(slot, fingerprint, Arc::new(partial), material.path_version);
+    let stored = store_partial(
+        slot,
+        fingerprint,
+        Arc::new(partial),
+        material.path_version,
+        material.eviction_mark,
+    );
     if stored {
         PARTIAL_REFRESHES.fetch_add(1, Ordering::Relaxed);
     }
@@ -459,7 +495,13 @@ fn prove(
             } else {
                 // Store only after finish succeeds, so a partial that cannot
                 // be finished never occupies the slot.
-                store_partial(slot, fingerprint, partial, material.path_version);
+                store_partial(
+                    slot,
+                    fingerprint,
+                    partial,
+                    material.path_version,
+                    material.eviction_mark,
+                );
             }
             Ok(done)
         }
@@ -510,7 +552,7 @@ pub(crate) fn clone_slot_for_test(from: &str, to: &str) {
         .map(|entry| entry.path_version)
         .expect("source slot");
     assert!(
-        store_partial(to, fingerprint, partial, version),
+        store_partial(to, fingerprint, partial, version, eviction_mark(to)),
         "bystander slot stored"
     );
 }
@@ -770,6 +812,7 @@ pub(crate) fn generate_for_test(
         path_elements_hex: vec!["00".repeat(32); RLN_TREE_DEPTH],
         path_indices: vec![0u8; RLN_TREE_DEPTH],
         path_version: 0,
+        eviction_mark: 0,
     };
     generate(&material, signal_to_x(signal), epoch, rln_identifier).expect("test proof")
 }
@@ -796,6 +839,7 @@ mod tests {
             path_elements_hex: elements,
             path_indices: indices,
             path_version: 0,
+            eviction_mark: 0,
         }
     }
 
@@ -1118,7 +1162,8 @@ mod tests {
             &m.membership_hash,
             fingerprint,
             Arc::new(bad),
-            m.path_version
+            m.path_version,
+            m.eviction_mark
         ));
 
         let fallbacks_before = partial_stats().fallbacks;
@@ -1143,6 +1188,33 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_unsealed_before_an_eviction_does_not_store() {
+        let rln_id = [9u8; 32];
+        let mut m = material_from_seed(&[50u8; 32], 100, 0);
+        m.eviction_mark = eviction_mark(&m.membership_hash);
+        // The keystore locks while this build holds the unsealed secret.
+        evict_partial(&m.membership_hash);
+
+        assert!(
+            !warm_partial(&m).expect("warm"),
+            "a warm that unsealed before the lock must not store"
+        );
+        let p = generate(&m, signal_to_x(b"e"), 4, &rln_id).expect("still proves");
+        assert!(verify(&p, signal_to_x(b"e"), &[p.root()]).expect("verify"));
+        assert_eq!(
+            partial_slot_fingerprint(&m.membership_hash),
+            None,
+            "a proof that unsealed before the lock must not store either"
+        );
+
+        m.eviction_mark = eviction_mark(&m.membership_hash);
+        assert!(
+            warm_partial(&m).expect("warm"),
+            "a build that unsealed after the eviction stores again"
+        );
+    }
+
+    #[test]
     fn store_partial_refuses_an_older_path_version() {
         let mut m = material_from_seed(&[48u8; 32], 100, 0);
         m.path_version = 2;
@@ -1153,7 +1225,7 @@ mod tests {
         let other = [9u8; 32];
 
         assert!(
-            !store_partial(&m.membership_hash, other, Arc::clone(&partial), 1),
+            !store_partial(&m.membership_hash, other, Arc::clone(&partial), 1, 0),
             "an older generation must not replace the slot"
         );
         assert_eq!(
@@ -1162,7 +1234,7 @@ mod tests {
         );
         assert_eq!(partial_hits(&m.membership_hash), Some(1));
 
-        assert!(store_partial(&m.membership_hash, other, partial, 2));
+        assert!(store_partial(&m.membership_hash, other, partial, 2, 0));
         assert_eq!(partial_slot_fingerprint(&m.membership_hash), Some(other));
         assert_eq!(
             partial_hits(&m.membership_hash),
