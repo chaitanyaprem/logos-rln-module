@@ -110,6 +110,7 @@ pub(crate) fn generate_proof_with(
         store.reserve_message_id(hash, &rln_id_hex, epoch, retain_floor, rate_limit, size)?;
 
     let material = proof::WitnessMaterial {
+        membership_hash: hash.to_string(),
         identity_secret_hash_hex: std::mem::take(&mut credential.identity_secret_hash),
         rate_limit,
         message_id,
@@ -126,6 +127,41 @@ pub(crate) fn generate_proof_with(
         obj.insert("proof_canonical".to_string(), rlp.canonical_hex().into());
     }
     Ok(out)
+}
+
+/// Rebuild a membership's cached partial proof if its path or rate limit
+/// changed since the last build, so the next `generate_proof` only finishes
+/// it. Called by the poller right after it refreshes the path. Returns whether
+/// a partial was built; a locked keystore is not an error (nothing to warm).
+pub(crate) fn warm_partial(
+    store: &Store,
+    hash: &str,
+    leaf_index: u64,
+    rate_limit: u64,
+) -> Result<bool, ApiError> {
+    if rate_limit == 0 {
+        return Ok(false);
+    }
+    let Some((path_elements_hex, path_indices)) = path_cache::hit(hash, leaf_index) else {
+        return Ok(false);
+    };
+    if proof::partial_is_current(hash, rate_limit, &path_elements_hex, &path_indices) {
+        return Ok(false);
+    }
+    let mut credential = match store.unseal_credential(hash) {
+        Ok(credential) => credential,
+        Err(e) if e.kind == ErrorKind::Locked => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let material = proof::WitnessMaterial {
+        membership_hash: hash.to_string(),
+        identity_secret_hash_hex: std::mem::take(&mut credential.identity_secret_hash),
+        rate_limit,
+        message_id: 0,
+        path_elements_hex,
+        path_indices,
+    };
+    proof::warm_partial(&material).map_err(proof_error)
 }
 
 pub(crate) fn epoch_of_timestamp(timestamp: &str, epoch_size_sec: u64) -> Result<u64, ApiError> {

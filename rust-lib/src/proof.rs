@@ -1,15 +1,19 @@
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use rand_chacha::ChaCha20Rng;
 use rln::prelude::{
     compute_id_secret, graph_from_raw, hash_to_field_le, zkey_from_raw, ArkGroth16Backend,
-    CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PoseidonHash, Proof,
-    RLNBuilder, RLNMerkleProof, RLNProof, RLNProofValues, RLNWitnessInput, SecretFr, Stateless,
-    VerifyProofError, RLN,
+    CanonicalDeserialize, CanonicalSerialize, Fr, Hasher, IdentityKeys, PartialProof, PoseidonHash,
+    Proof, RLNBuilder, RLNMerkleProof, RLNPartialWitnessInput, RLNProof, RLNProofValues,
+    RLNWitnessInput, SecretFr, Stateless, VerifyProofError, RLN,
 };
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::registry_id::{bytes_to_hex, hex_decode_into, hex_to_bytes32, hex_to_vec};
+use crate::util::lock;
 
 pub(crate) const RLN_TREE_DEPTH: usize = 10;
 
@@ -24,6 +28,8 @@ pub(crate) enum ProofError {
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub(crate) struct WitnessMaterial {
+    /// Names this membership's slot in the partial-proof cache.
+    pub(crate) membership_hash: String,
     pub(crate) identity_secret_hash_hex: String,
     pub(crate) rate_limit: u64,
     pub(crate) message_id: u64,
@@ -189,6 +195,202 @@ static RLN_STATELESS: LazyLock<RLN<Stateless, ArkGroth16Backend<PoseidonHash>>> 
             .build()
     });
 
+/// One partial proof per membership, over the part of the witness that stays
+/// fixed between messages: identity secret, rate limit and Merkle path.
+/// Groth16's blinding (r, s) is sampled fresh in `finish_proof`, so reusing a
+/// partial proof across messages is sound; only the per-message inputs (x,
+/// external nullifier, message_id) are proved each time. The partial proof is
+/// derived from the identity secret, so it lives in memory only.
+///
+/// `fingerprint` covers the rate limit and path the partial was built from. A
+/// refreshed path or a changed rate limit no longer matches, so the slot is
+/// rebuilt instead of serving a stale partial. The identity secret is fixed
+/// per membership, so the slot's key (the membership hash) already pins it.
+struct CachedPartial {
+    fingerprint: [u8; 32],
+    partial: PartialProof,
+    hits: u64,
+}
+
+static PARTIALS: Mutex<Option<HashMap<String, CachedPartial>>> = Mutex::new(None);
+
+static PARTIAL_HITS: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_MISSES: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_REFRESHES: AtomicU64 = AtomicU64::new(0);
+static PARTIAL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide partial-proof cache counters: hits (finish_proof only),
+/// misses (built on the proving path), refreshes (built ahead of use by the
+/// poller), fallbacks (a full proof after a partial build or finish failed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartialStats {
+    pub(crate) hits: u64,
+    pub(crate) misses: u64,
+    pub(crate) refreshes: u64,
+    pub(crate) fallbacks: u64,
+}
+
+pub(crate) fn partial_stats() -> PartialStats {
+    PartialStats {
+        hits: PARTIAL_HITS.load(Ordering::Relaxed),
+        misses: PARTIAL_MISSES.load(Ordering::Relaxed),
+        refreshes: PARTIAL_REFRESHES.load(Ordering::Relaxed),
+        fallbacks: PARTIAL_FALLBACKS.load(Ordering::Relaxed),
+    }
+}
+
+fn partial_fingerprint(
+    rate_limit: u64,
+    path_elements_hex: &[String],
+    path_indices: &[u8],
+) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"logos-rln-partial-proof-v1");
+    h.update(rate_limit.to_le_bytes());
+    for element in path_elements_hex {
+        h.update(element.as_bytes());
+    }
+    h.update(path_indices);
+    h.finalize().into()
+}
+
+fn material_fingerprint(material: &WitnessMaterial) -> [u8; 32] {
+    partial_fingerprint(
+        material.rate_limit,
+        &material.path_elements_hex,
+        &material.path_indices,
+    )
+}
+
+/// The slot's partial if it was built from this exact fingerprint; counts a hit.
+fn cached_partial(slot: &str, fingerprint: &[u8; 32]) -> Option<PartialProof> {
+    let mut guard = lock(&PARTIALS);
+    let entry = guard.as_mut()?.get_mut(slot)?;
+    if &entry.fingerprint != fingerprint {
+        return None;
+    }
+    entry.hits += 1;
+    Some(entry.partial.clone())
+}
+
+fn store_partial(slot: &str, fingerprint: [u8; 32], partial: PartialProof) {
+    lock(&PARTIALS).get_or_insert_with(HashMap::new).insert(
+        slot.to_string(),
+        CachedPartial {
+            fingerprint,
+            partial,
+            hits: 0,
+        },
+    );
+}
+
+fn drop_partial(slot: &str) {
+    if let Some(map) = lock(&PARTIALS).as_mut() {
+        map.remove(slot);
+    }
+}
+
+/// Whether `slot` holds a partial built from this rate limit and path, so the
+/// poller can skip unsealing the credential when nothing changed.
+pub(crate) fn partial_is_current(
+    slot: &str,
+    rate_limit: u64,
+    path_elements_hex: &[String],
+    path_indices: &[u8],
+) -> bool {
+    let fingerprint = partial_fingerprint(rate_limit, path_elements_hex, path_indices);
+    lock(&PARTIALS)
+        .as_ref()
+        .and_then(|m| m.get(slot))
+        .is_some_and(|e| e.fingerprint == fingerprint)
+}
+
+/// Build and cache the membership's partial proof ahead of use, so the first
+/// proof after a path change only runs `finish_proof`. Returns whether a new
+/// partial was built (false when the slot was already current).
+pub(crate) fn warm_partial(material: &WitnessMaterial) -> Result<bool, ProofError> {
+    let fingerprint = material_fingerprint(material);
+    if partial_is_current(
+        &material.membership_hash,
+        material.rate_limit,
+        &material.path_elements_hex,
+        &material.path_indices,
+    ) {
+        return Ok(false);
+    }
+    // x and the external nullifier are not part of the partial witness, so any
+    // value serves here.
+    let witness = build_witness(material, Fr::from(0u64), Fr::from(0u64))?;
+    let partial = RLN_STATELESS
+        .generate_partial_proof(&RLNPartialWitnessInput::from(&witness))
+        .map_err(|e| ProofError::Engine(format!("generate partial: {e}")))?;
+    store_partial(&material.membership_hash, fingerprint, partial);
+    PARTIAL_REFRESHES.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Prove with the membership's cached partial when it matches, building it on
+/// a miss. Any partial-proof failure drops the slot and falls back to a full
+/// proof, so a bad cache entry costs time and never fails a send.
+fn prove(
+    material: &WitnessMaterial,
+    witness: &RLNWitnessInput,
+) -> Result<(Proof, RLNProofValues), ProofError> {
+    let slot = material.membership_hash.as_str();
+    let fingerprint = material_fingerprint(material);
+    let partial = match cached_partial(slot, &fingerprint) {
+        Some(partial) => {
+            PARTIAL_HITS.fetch_add(1, Ordering::Relaxed);
+            Some(partial)
+        }
+        None => {
+            PARTIAL_MISSES.fetch_add(1, Ordering::Relaxed);
+            match RLN_STATELESS.generate_partial_proof(&RLNPartialWitnessInput::from(witness)) {
+                Ok(partial) => {
+                    store_partial(slot, fingerprint, partial.clone());
+                    Some(partial)
+                }
+                Err(e) => {
+                    PARTIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("rln proof: {slot} partial proof build failed, proving in full: {e}");
+                    None
+                }
+            }
+        }
+    };
+    if let Some(partial) = partial {
+        match RLN_STATELESS.finish_proof(&partial, witness) {
+            Ok(done) => return Ok(done),
+            Err(e) => {
+                PARTIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                drop_partial(slot);
+                eprintln!("rln proof: {slot} finish_proof failed, proving in full: {e}");
+            }
+        }
+    }
+    RLN_STATELESS
+        .generate_proof(witness)
+        .map_err(|e| ProofError::Engine(format!("generate: {e}")))
+}
+
+#[cfg(test)]
+pub(crate) fn partial_hits(slot: &str) -> Option<u64> {
+    lock(&PARTIALS).as_ref()?.get(slot).map(|e| e.hits)
+}
+
+#[cfg(test)]
+pub(crate) fn partial_slot_fingerprint(slot: &str) -> Option<[u8; 32]> {
+    lock(&PARTIALS).as_ref()?.get(slot).map(|e| e.fingerprint)
+}
+
+/// Finish the slot's partial once, as a proof would, so tests can tell a
+/// kept slot (hits stay) from a rebuilt one (hits reset to 0).
+#[cfg(test)]
+pub(crate) fn touch_partial_for_test(slot: &str) {
+    let fingerprint = partial_slot_fingerprint(slot).expect("slot exists");
+    cached_partial(slot, &fingerprint).expect("slot current");
+}
+
 fn single_values(values: &RLNProofValues) -> Result<(Fr, Fr), ProofError> {
     match (values.y(), values.nullifier()) {
         (Some(y), Some(nullifier)) => Ok((y, nullifier)),
@@ -334,6 +536,18 @@ pub(crate) fn generate(
     epoch: u64,
     rln_identifier: &[u8; 32],
 ) -> Result<RateLimitProof, ProofError> {
+    let witness = build_witness(material, x, external_nullifier(epoch, rln_identifier))?;
+    let (proof, values) = prove(material, &witness)?;
+    let mut rlp = RateLimitProof::from_parts(proof, values)?;
+    rlp.epoch = Some(epoch);
+    Ok(rlp)
+}
+
+fn build_witness(
+    material: &WitnessMaterial,
+    x: Fr,
+    external_nullifier: Fr,
+) -> Result<RLNWitnessInput, ProofError> {
     if material.path_elements_hex.len() != material.path_indices.len() {
         return Err(ProofError::BadInput(format!(
             "merkle path length mismatch: {} elements vs {} indices",
@@ -363,7 +577,7 @@ pub(crate) fn generate(
         .map(|h| hex_to_fr(h, "path_element"))
         .collect::<Result<Vec<Fr>, _>>()?;
 
-    let witness = RLNWitnessInput::new_single()
+    RLNWitnessInput::new_single()
         .identity_secret(identity_secret)
         .user_message_limit(Fr::from(material.rate_limit))
         .message_id(Fr::from(material.message_id))
@@ -372,16 +586,9 @@ pub(crate) fn generate(
             material.path_indices.clone(),
         ))
         .x(x)
-        .external_nullifier(external_nullifier(epoch, rln_identifier))
+        .external_nullifier(external_nullifier)
         .build()
-        .map_err(|e| ProofError::BadInput(format!("witness: {e}")))?;
-
-    let (proof, values) = RLN_STATELESS
-        .generate_proof(&witness)
-        .map_err(|e| ProofError::Engine(format!("generate: {e}")))?;
-    let mut rlp = RateLimitProof::from_parts(proof, values)?;
-    rlp.epoch = Some(epoch);
-    Ok(rlp)
+        .map_err(|e| ProofError::BadInput(format!("witness: {e}")))
 }
 
 pub(crate) fn verify(
@@ -432,6 +639,7 @@ pub(crate) fn generate_for_test(
 ) -> RateLimitProof {
     let keys = IdentityKeys::generate_seeded::<PoseidonHash, ChaCha20Rng>(seed);
     let material = WitnessMaterial {
+        membership_hash: bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
         identity_secret_hash_hex: bytes_to_hex(&secret_to_bytes32(&keys.identity_secret())),
         rate_limit: 100,
         message_id: 0,
@@ -456,6 +664,7 @@ mod tests {
         let secret_hex = bytes_to_hex(&secret_to_bytes32(&keys.identity_secret()));
         let (elements, indices) = zero_path();
         WitnessMaterial {
+            membership_hash: bytes_to_hex(&fr_to_bytes32(&keys.id_commitment())),
             identity_secret_hash_hex: secret_hex,
             rate_limit,
             message_id,
@@ -625,6 +834,128 @@ mod tests {
             generate(&material, signal_to_x(b"hello"), 1231028105, &rln_id).expect("generate");
         let root = proof.root();
         assert!(verify(&proof, signal_to_x(b"hello"), &[root]).expect("verify"));
+    }
+
+    // Each test uses its own seed, so its own membership slot: the cache is
+    // process-wide and tests run in parallel.
+
+    #[test]
+    fn the_cached_partial_is_reused_and_proofs_are_still_reblinded() {
+        let rln_id = [9u8; 32];
+        let first = material_from_seed(&[42u8; 32], 100, 0);
+        let second = material_from_seed(&[42u8; 32], 100, 1);
+        let a = generate(&first, signal_to_x(b"one"), 77, &rln_id).expect("generate a");
+        assert_eq!(
+            partial_hits(&first.membership_hash),
+            Some(0),
+            "first proof builds the slot"
+        );
+        let b = generate(&second, signal_to_x(b"two"), 77, &rln_id).expect("generate b");
+        let c = generate(&second, signal_to_x(b"two"), 77, &rln_id).expect("generate c");
+        assert_eq!(
+            partial_hits(&first.membership_hash),
+            Some(2),
+            "later proofs for the same membership and path finish the cached partial"
+        );
+        assert!(verify(&a, signal_to_x(b"one"), &[a.root()]).expect("verify a"));
+        assert!(verify(&b, signal_to_x(b"two"), &[b.root()]).expect("verify b"));
+        assert!(verify(&c, signal_to_x(b"two"), &[c.root()]).expect("verify c"));
+        assert_ne!(
+            a.nullifier(),
+            b.nullifier(),
+            "message_id still binds the nullifier"
+        );
+        assert_ne!(
+            b.canonical, c.canonical,
+            "finish_proof re-blinds, so equal inputs give distinct proofs"
+        );
+    }
+
+    #[test]
+    fn a_changed_path_replaces_the_membership_slot() {
+        let rln_id = [9u8; 32];
+        let mut moved = material_from_seed(&[43u8; 32], 100, 0);
+        let a = generate(&moved, signal_to_x(b"m"), 5, &rln_id).expect("generate a");
+        generate(&moved, signal_to_x(b"m2"), 5, &rln_id).expect("warm hit");
+        assert_eq!(partial_hits(&moved.membership_hash), Some(1));
+
+        let mut buf = [0u8; 32];
+        Fr::from(5u64)
+            .serialize_compressed(&mut buf[..])
+            .expect("32 bytes");
+        moved.path_elements_hex[0] = bytes_to_hex(&buf);
+        assert!(!partial_is_current(
+            &moved.membership_hash,
+            moved.rate_limit,
+            &moved.path_elements_hex,
+            &moved.path_indices
+        ));
+        let b = generate(&moved, signal_to_x(b"m"), 5, &rln_id).expect("generate b");
+        assert_eq!(
+            partial_hits(&moved.membership_hash),
+            Some(0),
+            "the new path rebuilt the slot instead of finishing the old partial"
+        );
+        assert_ne!(
+            a.root(),
+            b.root(),
+            "the new path proves against its own root"
+        );
+        assert!(verify(&b, signal_to_x(b"m"), &[b.root()]).expect("verify b"));
+        assert!(!verify(&b, signal_to_x(b"m"), &[a.root()]).expect("verify b vs old root"));
+    }
+
+    #[test]
+    fn a_changed_rate_limit_replaces_the_membership_slot() {
+        let rln_id = [9u8; 32];
+        let mut m = material_from_seed(&[45u8; 32], 100, 0);
+        generate(&m, signal_to_x(b"r"), 5, &rln_id).expect("generate at 100");
+        m.rate_limit = 20;
+        let p = generate(&m, signal_to_x(b"r"), 5, &rln_id).expect("generate at 20");
+        assert_eq!(
+            partial_hits(&m.membership_hash),
+            Some(0),
+            "rebuilt for the new limit"
+        );
+        assert!(verify(&p, signal_to_x(b"r"), &[p.root()]).expect("verify"));
+    }
+
+    #[test]
+    fn warm_partial_builds_ahead_of_use() {
+        let rln_id = [9u8; 32];
+        let m = material_from_seed(&[44u8; 32], 100, 0);
+        assert_eq!(partial_hits(&m.membership_hash), None);
+        assert!(warm_partial(&m).expect("warm"), "a cold slot is built");
+        assert!(
+            !warm_partial(&m).expect("warm again"),
+            "a current slot is left alone"
+        );
+        let p = generate(&m, signal_to_x(b"w"), 9, &rln_id).expect("generate");
+        assert_eq!(
+            partial_hits(&m.membership_hash),
+            Some(1),
+            "the first proof after warming already hits"
+        );
+        assert!(verify(&p, signal_to_x(b"w"), &[p.root()]).expect("verify"));
+    }
+
+    #[test]
+    fn a_corrupt_partial_falls_back_to_a_full_proof() {
+        let rln_id = [9u8; 32];
+        let m = material_from_seed(&[46u8; 32], 100, 0);
+        warm_partial(&m).expect("warm");
+        let mut bad =
+            cached_partial(&m.membership_hash, &material_fingerprint(&m)).expect("warmed slot");
+        bad.mask.clear();
+        store_partial(&m.membership_hash, material_fingerprint(&m), bad);
+
+        let p = generate(&m, signal_to_x(b"f"), 3, &rln_id).expect("falls back, never fails");
+        assert!(verify(&p, signal_to_x(b"f"), &[p.root()]).expect("verify"));
+        assert_eq!(
+            partial_hits(&m.membership_hash),
+            None,
+            "the failed slot is dropped so the next proof rebuilds it"
+        );
     }
 
     #[test]

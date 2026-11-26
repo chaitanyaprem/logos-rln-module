@@ -186,10 +186,10 @@ pub(crate) fn refresh_paths() {
     if crate::worker::is_stopped() {
         return;
     }
-    let usable = match sealed::current() {
-        Some(store) => store.refreshable_records(),
-        None => return,
+    let Some(store) = sealed::current() else {
+        return;
     };
+    let usable = store.refreshable_records();
     for record in usable.into_iter().filter(|r| r.cache.state.is_usable()) {
         let hash = &record.hash;
         let registry = match registry_id::parse(&record.identity.registry_id) {
@@ -214,10 +214,38 @@ pub(crate) fn refresh_paths() {
                 "membership poller: {hash} path refresh failed: {}",
                 e.message
             );
+        } else {
+            // Keep the partial proof in step with the path, so the first
+            // proof after a tree change does not pay for building it.
+            let rate_limit = record.cache.rate_limit.unwrap_or(0);
+            match crate::proof_api::warm_partial(&store, hash, leaf_index, rate_limit) {
+                Ok(true) => eprintln!("membership poller: {hash} partial proof rebuilt"),
+                Ok(false) => {}
+                Err(e) => eprintln!(
+                    "membership poller: {hash} partial proof rebuild failed: {}",
+                    e.message
+                ),
+            }
         }
         if crate::worker::is_stopped() {
             return;
         }
+    }
+    log_partial_stats();
+}
+
+/// One line per poll cycle in which the partial-proof counters moved, so an
+/// operator can see the cache working (mostly hits) or not (misses, fallbacks).
+fn log_partial_stats() {
+    static LAST: std::sync::Mutex<Option<crate::proof::PartialStats>> = std::sync::Mutex::new(None);
+    let now = crate::proof::partial_stats();
+    let mut last = crate::lock(&LAST);
+    if *last != Some(now) {
+        eprintln!(
+            "rln proof: partial-proof cache hits={} misses={} refreshes={} fallbacks={}",
+            now.hits, now.misses, now.refreshes, now.fallbacks
+        );
+        *last = Some(now);
     }
 }
 
@@ -278,6 +306,144 @@ mod tests {
             (rec.cache.state, rec.cache.leaf_index),
             (MembershipState::Active, Some(4))
         );
+
+        crate::sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tree_change_rebuilds_the_partial_proof_and_an_unchanged_tree_keeps_it() {
+        use crate::proof;
+        use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir =
+            std::env::temp_dir().join(format!("rln-poller-partial-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let registry = "fakens:local:partial";
+        let hash = "poller-partial-slot";
+        // A secret that is a canonical field element (LE 1), so it can prove.
+        let secret = format!("01{}", "00".repeat(31));
+        seed_membership(
+            &store,
+            hash,
+            registry,
+            &"57".repeat(32),
+            "",
+            &secret,
+            MembershipState::Active,
+            3,
+            100,
+        );
+
+        // The tree as the provider reports it: only the sibling at level 0
+        // differs between the two snapshots, like another member registering.
+        let install = |sibling: &str| {
+            crate::test_support::install_backend(fake::backend(
+                FakeTree {
+                    proof: Some(serde_json::json!({
+                        "depth": 2, "leaf": "aa".repeat(32), "leaf_index": 3,
+                        "path_elements": [sibling, "00".repeat(32)], "path_indices": [1, 1],
+                        "root": "bb".repeat(32),
+                    })),
+                    roots: None,
+                },
+                FakeRegistry {
+                    membership: Some(Some((MembershipState::Active, Some(3), 100))),
+                    bounds: None,
+                },
+                FakePayer::default(),
+            ))
+        };
+
+        install(&"00".repeat(32));
+        poller::refresh_paths();
+        let first = proof::partial_slot_fingerprint(hash).expect("poller built the partial");
+        assert_eq!(proof::partial_hits(hash), Some(0));
+
+        proof::touch_partial_for_test(hash);
+        poller::refresh_paths();
+        assert_eq!(proof::partial_slot_fingerprint(hash), Some(first));
+        assert_eq!(
+            proof::partial_hits(hash),
+            Some(1),
+            "an unchanged tree keeps the slot (no rebuild)"
+        );
+
+        install(&format!("02{}", "00".repeat(31)));
+        poller::refresh_paths();
+        let second = proof::partial_slot_fingerprint(hash).expect("slot after tree change");
+        assert_ne!(second, first, "the tree change reached the slot");
+        assert_eq!(
+            proof::partial_hits(hash),
+            Some(0),
+            "the poller rebuilt the partial for the new path"
+        );
+
+        crate::sealed_store::store::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_locked_keystore_skips_the_partial_rebuild() {
+        use crate::provider::fake::{self, FakePayer, FakeRegistry, FakeTree};
+        let _serial = crate::lock(&TEST_GLOBAL_LOCK);
+        let dir =
+            std::env::temp_dir().join(format!("rln-poller-locked-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_imp, store) = imp_with_store(dir.clone());
+        store.unlock("pw").unwrap();
+        let hash = "poller-locked-slot";
+        seed_membership(
+            &store,
+            hash,
+            "fakens:local:locked",
+            &"58".repeat(32),
+            "",
+            &format!("01{}", "00".repeat(31)),
+            MembershipState::Active,
+            3,
+            100,
+        );
+        crate::test_support::install_backend(fake::backend(
+            FakeTree {
+                proof: Some(serde_json::json!({
+                    "depth": 2, "leaf": "aa".repeat(32), "leaf_index": 3,
+                    "path_elements": ["00".repeat(32), "00".repeat(32)], "path_indices": [1, 1],
+                    "root": "bb".repeat(32),
+                })),
+                roots: None,
+            },
+            FakeRegistry {
+                membership: Some(Some((MembershipState::Active, Some(3), 100))),
+                bounds: None,
+            },
+            FakePayer::default(),
+        ));
+        store.lock();
+
+        let leaf = 3;
+        crate::path_cache::fill_path_cache(
+            &crate::registry_id::parse("fakens:local:locked").unwrap(),
+            hash,
+            leaf,
+            &FakeTree {
+                proof: Some(serde_json::json!({
+                    "depth": 2, "leaf": "aa".repeat(32), "leaf_index": 3,
+                    "path_elements": ["00".repeat(32), "00".repeat(32)], "path_indices": [1, 1],
+                    "root": "bb".repeat(32),
+                })),
+                roots: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            !crate::proof_api::warm_partial(&store, hash, leaf, 100)
+                .expect("locked is not an error"),
+            "nothing to warm while locked"
+        );
+        assert_eq!(crate::proof::partial_slot_fingerprint(hash), None);
 
         crate::sealed_store::store::publish(None);
         let _ = std::fs::remove_dir_all(&dir);
